@@ -114,6 +114,7 @@ type Backend interface {
 	CheckInCalcOrderCache(hash common.Hash) (*big.Int, int, bool)
 	AddToCalcOrderCache(hash common.Hash, order int, intrinsicS *big.Int)
 	GetPrimeBlock(blockHash common.Hash) *types.WorkObject
+	GetKQuaiAndUpdateBit(blockHash common.Hash) (*big.Int, uint8, error)
 	consensus.ChainHeaderReader
 	TxMiningEnabled() bool
 	GetWorkShareThreshold() int
@@ -140,9 +141,9 @@ type Backend interface {
 	Stats() (pending int, queued int, qi int)
 	TxPoolContent() (map[common.InternalAddress]types.Transactions, map[common.InternalAddress]types.Transactions)
 	TxPoolContentFrom(addr common.Address) (types.Transactions, types.Transactions)
-	GetMinGasPrice() *big.Int
 	GetPoolGasPrice() *big.Int
 	SendTxToSharingClients(tx *types.Transaction)
+	GetRollingFeeInfo() (min, max, avg *big.Int)
 
 	// Filter API
 	BloomStatus() (uint64, uint64)

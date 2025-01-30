@@ -17,6 +17,7 @@ import (
 	"github.com/dominant-strategies/go-quai/core/rawdb"
 	"github.com/dominant-strategies/go-quai/core/state"
 	"github.com/dominant-strategies/go-quai/core/types"
+	"github.com/dominant-strategies/go-quai/core/vm"
 	"github.com/dominant-strategies/go-quai/crypto/multiset"
 	"github.com/dominant-strategies/go-quai/ethdb"
 	"github.com/dominant-strategies/go-quai/log"
@@ -203,6 +204,10 @@ func (progpow *Progpow) VerifyUncles(chain consensus.ChainReader, block *types.W
 		}
 		uncles.Add(hash)
 
+		if uncle.PrimaryCoinbase().IsInQiLedgerScope() && block.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("uncle inclusion is not allowed before block %v", params.ControllerKickInBlock)
+		}
+
 		// Make sure the uncle has a valid ancestry
 		if ancestors[hash] != nil {
 			return consensus.ErrUncleIsAncestor
@@ -227,6 +232,9 @@ func (progpow *Progpow) VerifyUncles(chain consensus.ChainReader, block *types.W
 			return err
 		}
 
+		if uncle.NumberU64() < 2*params.BlocksPerMonth && uncle.Lock() != 0 {
+			return fmt.Errorf("workshare lock byte: %v is not valid: it has to be %v for the first two months", uncle.Lock(), 0)
+		}
 		// Verify the block's difficulty based on its timestamp and parent's difficulty
 		// difficulty adjustment can only be checked in zone
 		if nodeCtx == common.ZONE_CTX {
@@ -383,6 +391,25 @@ func (progpow *Progpow) verifyHeader(chain consensus.ChainHeaderReader, header, 
 		}
 	}
 
+	if nodeCtx == common.PRIME_CTX {
+		if header.PrimeStateRoot() != types.EmptyRootHash {
+			return fmt.Errorf("invalid prime state root: have %v, want %v", header.PrimeStateRoot(), types.EmptyRootHash)
+		}
+	}
+
+	if nodeCtx == common.REGION_CTX {
+		if header.RegionStateRoot() != types.EmptyRootHash {
+			return fmt.Errorf("invalid region state root: have %v, want %v", header.RegionStateRoot(), types.EmptyRootHash)
+		}
+	}
+
+	if nodeCtx == common.PRIME_CTX {
+		expectedMinerDifficulty := chain.ComputeMinerDifficulty(parent)
+		if header.MinerDifficulty().Cmp(expectedMinerDifficulty) != 0 {
+			return fmt.Errorf("invalid miner difficulty: have %v, want %v", header.MinerDifficulty(), expectedMinerDifficulty)
+		}
+	}
+
 	if nodeCtx == common.ZONE_CTX {
 		var expectedExpansionNumber uint8
 		expectedExpansionNumber, err := chain.ComputeExpansionNumber(parent)
@@ -391,6 +418,9 @@ func (progpow *Progpow) verifyHeader(chain consensus.ChainHeaderReader, header, 
 		}
 		if header.ExpansionNumber() != expectedExpansionNumber {
 			return fmt.Errorf("invalid expansion number: have %v, want %v", header.ExpansionNumber(), expectedExpansionNumber)
+		}
+		if header.PrimaryCoinbase().IsInQiLedgerScope() && header.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("Qi coinbase is not allowed before block %v", params.ControllerKickInBlock)
 		}
 	}
 
@@ -401,21 +431,8 @@ func (progpow *Progpow) verifyHeader(chain consensus.ChainHeaderReader, header, 
 		if err != nil {
 			return fmt.Errorf("out-of-scope primary coinbase in the header: %v location: %v nodeLocation: %v, err %s", header.PrimaryCoinbase(), header.Location(), progpow.config.NodeLocation, err)
 		}
-		_, err = header.SecondaryCoinbase().InternalAddress()
-		if err != nil {
-			return fmt.Errorf("out-of-scope secondary coinbase in the header: %v location: %v nodeLocation: %v, err %s", header.SecondaryCoinbase(), header.Location(), progpow.config.NodeLocation, err)
-		}
-
-		// One of the coinbases has to be Quai and the other one has to be Qi
-		quaiAddress := header.PrimaryCoinbase().IsInQuaiLedgerScope()
-		if quaiAddress {
-			if !header.SecondaryCoinbase().IsInQiLedgerScope() {
-				return fmt.Errorf("primary coinbase: %v is in quai ledger but secondary coinbase: %v is not in Qi ledger", header.PrimaryCoinbase(), header.SecondaryCoinbase())
-			}
-		} else {
-			if !header.SecondaryCoinbase().IsInQuaiLedgerScope() {
-				return fmt.Errorf("primary coinbase: %v is in qi ledger but secondary coinbase: %v is not in Quai ledger", header.PrimaryCoinbase(), header.SecondaryCoinbase())
-			}
+		if header.NumberU64(common.ZONE_CTX) < 2*params.BlocksPerMonth && header.Lock() != 0 {
+			return fmt.Errorf("header lock byte: %v is not valid: it has to be %v for the first two months", header.Lock(), 0)
 		}
 		// Verify that the gas limit is <= 2^63-1
 		cap := uint64(0x7fffffffffffffff)
@@ -441,6 +458,10 @@ func (progpow *Progpow) verifyHeader(chain consensus.ChainHeaderReader, header, 
 		expectedStateLimit := misc.CalcStateLimit(parent, params.StateCeil)
 		if header.StateLimit() != expectedStateLimit {
 			return fmt.Errorf("invalid StateLimit: have %d, want %d, parentStateLimit %d", expectedStateLimit, header.StateLimit(), parent.StateLimit())
+		}
+		expectedBaseFee := chain.CalcBaseFee(parent)
+		if header.BaseFee().Cmp(expectedBaseFee) != 0 {
+			return fmt.Errorf("invalid baseFee: have %v, want %v, parentBaseFee %v", expectedBaseFee, header.BaseFee(), parent.BaseFee())
 		}
 		var expectedPrimeTerminusHash common.Hash
 		var expectedPrimeTerminusNumber *big.Int
@@ -655,7 +676,11 @@ func (progpow *Progpow) Finalize(chain consensus.ChainHeaderReader, batch ethdb.
 		multiSet = multiset.New()
 		alloc := core.ReadGenesisAlloc("genallocs/gen_alloc_quai_"+nodeLocation.Name()+".json", progpow.logger)
 		progpow.logger.WithField("alloc", len(alloc)).Info("Allocating genesis accounts")
-
+		internalLockupContract, err := vm.LockupContractAddresses[[2]byte{nodeLocation[0], nodeLocation[1]}].InternalAddress()
+		if err != nil {
+			return nil, 0, fmt.Errorf("Error getting internal address for lockup contract, err %s", err)
+		}
+		state.SetNonce(internalLockupContract, 1)
 		for addressString, account := range alloc {
 			addr := common.HexToAddress(addressString, nodeLocation)
 			internal, err := addr.InternalAddress()
@@ -787,7 +812,7 @@ func TrimBlock(chain consensus.ChainHeaderReader, batch ethdb.Batch, denominatio
 		}
 		// Only the coinbase and conversion txs are allowed to have lockups that
 		// is non zero
-		if utxo.Lock.Sign() == 0 {
+		if utxo.Lock.Sign() != 0 {
 			continue
 		}
 		txHash, index, err := rawdb.ReverseUtxoKey(key)

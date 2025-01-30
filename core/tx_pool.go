@@ -104,10 +104,11 @@ var (
 )
 
 var (
-	evictionInterval          = time.Minute      // Time interval to check for evictable transactions
-	statsReportInterval       = 1 * time.Minute  // Time interval to report transaction pool stats
-	qiExpirationCheckInterval = 10 * time.Minute // Time interval to check for expired Qi transactions
-	qiExpirationCheckDivisor  = 5                // Check 1/nth of the pool for expired Qi transactions every interval
+	evictionInterval          = time.Minute            // Time interval to check for evictable transactions
+	statsReportInterval       = 1 * time.Minute        // Time interval to report transaction pool stats
+	qiExpirationCheckInterval = 10 * time.Minute       // Time interval to check for expired Qi transactions
+	qiExpirationCheckDivisor  = 5                      // Check 1/nth of the pool for expired Qi transactions every interval
+	txSharingPoolTimeout      = 200 * time.Millisecond // Time to exit the tx sharing call with client
 )
 
 var (
@@ -171,8 +172,7 @@ type blockChain interface {
 	GetMaxTxInWorkShare() uint64
 	CheckInCalcOrderCache(common.Hash) (*big.Int, int, bool)
 	AddToCalcOrderCache(common.Hash, int, *big.Int)
-	CalcMinBaseFee(block *types.WorkObject) *big.Int
-	CalcMaxBaseFee(block *types.WorkObject) (*big.Int, error)
+	CalcBaseFee(*types.WorkObject) *big.Int
 }
 
 // TxPoolConfig are the configuration parameters of the transaction pool.
@@ -218,7 +218,7 @@ var DefaultTxPoolConfig = TxPoolConfig{
 	GlobalQueue:     20048,
 	QiPoolSize:      10024,
 	QiTxLifetime:    30 * time.Minute,
-	Lifetime:        3 * time.Hour,
+	Lifetime:        5 * time.Minute,
 	ReorgFrequency:  1 * time.Second,
 }
 
@@ -579,6 +579,18 @@ func (pool *TxPool) loop() {
 					queuedEvictionMeter.Add(float64(len(list)))
 				}
 			}
+			for _, txList := range pool.pending {
+				txs := txList.Flatten()
+				if len(txs) == 0 {
+					continue
+				}
+				if time.Since(txs[0].Time()) > pool.config.Lifetime {
+					for _, tx := range txs {
+						pool.removeTx(tx.Hash(), true)
+					}
+					pendingDiscardMeter.Add(float64(len(txs)))
+				}
+			}
 			pool.mu.Unlock()
 
 		// Handle local transaction journal rotation
@@ -641,20 +653,6 @@ func (pool *TxPool) SetGasPrice(price *big.Int) {
 	}
 
 	pool.logger.WithField("price", price).Info("Transaction pool price threshold updated")
-}
-
-func (pool *TxPool) GetMinGasPrice() *big.Int {
-	currentHeader := pool.chain.CurrentBlock()
-	if currentHeader == nil {
-		return big.NewInt(0)
-	}
-	baseFeeMin := pool.chain.CalcMinBaseFee(currentHeader)
-
-	// Increase this estimate by ~10% so that we account for the difficulty adjustment
-	baseFeeMin = new(big.Int).Mul(baseFeeMin, big.NewInt(100))
-	baseFeeMin = new(big.Int).Div(baseFeeMin, big.NewInt(90))
-
-	return baseFeeMin
 }
 
 // Nonce returns the next nonce of an account, with all transactions executable
@@ -756,7 +754,7 @@ func (pool *TxPool) TxPoolPending(enforceTips bool) (map[common.AddressBytes]typ
 			// make sure that the tx has atleast min base fee as the gas
 			// price
 			currentBlock := pool.chain.CurrentBlock()
-			minBaseFee := pool.chain.CalcMinBaseFee(currentBlock)
+			minBaseFee := currentBlock.BaseFee()
 			if minBaseFee.Cmp(tx.GasPrice()) > 0 {
 				pool.logger.WithFields(log.Fields{
 					"tx":         tx.Hash().String(),
@@ -818,9 +816,6 @@ func (pool *TxPool) validateTx(tx *types.Transaction) error {
 	if tx.GasPrice().BitLen() > 256 {
 		return ErrFeeCapVeryHigh
 	}
-	if tx.MinerTip().BitLen() > 256 {
-		return ErrTipVeryHigh
-	}
 	var internal common.InternalAddress
 	addToCache := true
 	if sender := tx.From(pool.chainconfig.Location); sender != nil { // Check tx cache first
@@ -845,7 +840,7 @@ func (pool *TxPool) validateTx(tx *types.Transaction) error {
 		}
 	}
 	currentBlock := pool.chain.CurrentBlock()
-	minBaseFee := pool.chain.CalcMinBaseFee(currentBlock)
+	minBaseFee := currentBlock.BaseFee()
 	if minBaseFee.Cmp(tx.GasPrice()) > 0 {
 		pool.logger.WithFields(log.Fields{
 			"tx":         tx.Hash().String(),
@@ -927,7 +922,6 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			pool.logger.WithFields(log.Fields{
 				"hash":     hash,
 				"gasPrice": tx.GasPrice(),
-				"minerTip": tx.MinerTip(),
 			}).Trace("Discarding underpriced transaction")
 			underpricedTxMeter.Add(1)
 			return false, ErrUnderpriced
@@ -948,7 +942,6 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			pool.logger.WithFields(log.Fields{
 				"hash":     tx.Hash(),
 				"gasPrice": tx.GasPrice(),
-				"minerTip": tx.MinerTip(),
 			}).Trace("Discarding freshly underpriced transaction")
 			pendingDiscardMeter.Add(1)
 			pool.removeTx(tx.Hash(), false)
@@ -1268,11 +1261,11 @@ var feesErrs uint64
 func (pool *TxPool) addQiTxs(txs types.Transactions) []error {
 	errs := make([]error, 0)
 	currentBlock := pool.chain.CurrentBlock()
-	etxRLimit := len(currentBlock.Transactions()) / params.ETXRegionMaxFraction
+	etxRLimit := (uint64(len(currentBlock.Transactions())) * params.TxGas) / params.ETXRegionMaxFraction
 	if etxRLimit < params.ETXRLimitMin {
 		etxRLimit = params.ETXRLimitMin
 	}
-	etxPLimit := len(currentBlock.Transactions()) / params.ETXPrimeMaxFraction
+	etxPLimit := (uint64(len(currentBlock.Transactions())) * params.TxGas) / params.ETXPrimeMaxFraction
 	if etxPLimit < params.ETXPLimitMin {
 		etxPLimit = params.ETXPLimitMin
 	}
@@ -1357,11 +1350,11 @@ func (pool *TxPool) addQiTxsWithoutValidationLocked(txs types.Transactions) {
 			} else {
 				pool.logger.Debugf("Fee is nil or doesn't exist in cache for tx %s", tx.Hash().String())
 			}
-			etxRLimit := len(currentBlock.Transactions()) / params.ETXRegionMaxFraction
+			etxRLimit := (uint64(len(currentBlock.Transactions())) * params.TxGas) / params.ETXRegionMaxFraction
 			if etxRLimit < params.ETXRLimitMin {
 				etxRLimit = params.ETXRLimitMin
 			}
-			etxPLimit := len(currentBlock.Transactions()) / params.ETXPrimeMaxFraction
+			etxPLimit := (uint64(len(currentBlock.Transactions())) * params.TxGas) / params.ETXPrimeMaxFraction
 			if etxPLimit < params.ETXPLimitMin {
 				etxPLimit = params.ETXPLimitMin
 			}
@@ -1624,10 +1617,14 @@ func (pool *TxPool) txListenerLoop() {
 			// send to all pool sharing clients
 			for _, client := range pool.poolSharingClients {
 				if client != nil {
-					err := client.SendTransactionToPoolSharingClient(context.Background(), tx)
-					if err != nil {
-						pool.logger.WithField("err", err).Error("Error sending transaction to pool sharing client")
-					}
+					go func(*quaiclient.Client, *types.Transaction) {
+						ctx, cancel := context.WithTimeout(context.Background(), txSharingPoolTimeout)
+						defer cancel()
+						err := client.SendTransactionToPoolSharingClient(ctx, tx)
+						if err != nil {
+							pool.logger.WithField("err", err).Error("Error sending transaction to pool sharing client")
+						}
+					}(client, tx)
 				}
 			}
 		case <-pool.reorgShutdownCh:

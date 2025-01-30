@@ -30,6 +30,7 @@ import (
 	"github.com/dominant-strategies/go-quai/core"
 	"github.com/dominant-strategies/go-quai/core/rawdb"
 	"github.com/dominant-strategies/go-quai/core/types"
+	"github.com/dominant-strategies/go-quai/core/vm"
 	"github.com/dominant-strategies/go-quai/crypto"
 	"github.com/dominant-strategies/go-quai/log"
 	"github.com/dominant-strategies/go-quai/metrics_config"
@@ -61,15 +62,11 @@ func (s *PublicQuaiAPI) GasPrice(ctx context.Context) (*hexutil.Big, error) {
 	if s.b.NodeLocation().Context() != common.ZONE_CTX {
 		return (*hexutil.Big)(big.NewInt(0)), errors.New("gasPrice call can only be made in zone chain")
 	}
-	return (*hexutil.Big)(s.b.GetMinGasPrice()), nil
-}
-
-// MinerTip returns the gas price of the pool
-func (s *PublicQuaiAPI) MinerTip(ctx context.Context) *hexutil.Big {
-	if s.b.NodeLocation().Context() != common.ZONE_CTX {
-		return (*hexutil.Big)(big.NewInt(0))
-	}
-	return (*hexutil.Big)(s.b.GetPoolGasPrice())
+	blockBaseFee := s.b.CalcBaseFee(s.b.CurrentHeader())
+	// increase this by 20% to get guaraneteed inclusion adjusting for the worst case difficulty adjustment
+	blockBaseFee = new(big.Int).Mul(blockBaseFee, big.NewInt(120))
+	blockBaseFee = new(big.Int).Div(blockBaseFee, big.NewInt(100))
+	return (*hexutil.Big)(blockBaseFee), nil
 }
 
 // PublicBlockChainQuaiAPI provides an API to access the Quai blockchain.
@@ -271,6 +268,35 @@ func (s *PublicBlockChainQuaiAPI) GetLockupsByAddressAndRange(ctx context.Contex
 	return jsonLockups, nil
 }
 
+func (s *PublicBlockChainQuaiAPI) GetLockupsForContractAndMiner(ctx context.Context, ownerContract, beneficiaryMiner common.Address) (map[string]map[string][]interface{}, error) {
+	_, err := ownerContract.InternalAndQuaiAddress()
+	if err != nil {
+		return nil, err
+	}
+	_, err = beneficiaryMiner.InternalAddress()
+	if err != nil {
+		return nil, err
+	}
+	return vm.GetAllLockupData(s.b.Database(), ownerContract, beneficiaryMiner, s.b.NodeLocation(), s.b.Logger())
+}
+
+func (s *PublicBlockChainQuaiAPI) GetWrappedQiDeposit(ctx context.Context, ownerContract, beneficiaryMiner common.Address, blockNrOrHash rpc.BlockNumberOrHash) (*hexutil.Big, error) {
+	_, err := ownerContract.InternalAndQuaiAddress()
+	if err != nil {
+		return nil, err
+	}
+	_, err = beneficiaryMiner.InternalAddress()
+	if err != nil {
+		return nil, err
+	}
+	state, _, err := s.b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	balance, err := vm.GetWrappedQiDeposit(state, ownerContract, beneficiaryMiner, s.b.NodeLocation())
+	return (*hexutil.Big)(balance), err
+}
+
 func (s *PublicBlockChainQuaiAPI) GetOutPointsByAddressAndRange(ctx context.Context, address common.Address, start, end hexutil.Uint64) (map[string][]interface{}, error) {
 	if start > end {
 		return nil, fmt.Errorf("start is greater than end")
@@ -447,7 +473,7 @@ func GetDeltas(s *PublicBlockChainQuaiAPI, currentBlock *types.WorkObject, addre
 			lockupByte := tx.Data()[0]
 			lockup := new(big.Int).SetUint64(params.LockupByteToBlockDepth[lockupByte])
 			lockup.Add(lockup, currentBlock.Number(nodeCtx))
-			value := params.CalculateCoinbaseValueWithLockup(tx.Value(), lockupByte)
+			value := params.CalculateCoinbaseValueWithLockup(tx.Value(), lockupByte, currentBlock.NumberU64(common.ZONE_CTX))
 			denominations := misc.FindMinDenominations(value)
 			outputIndex := uint16(0)
 			// Iterate over the denominations in descending order
@@ -829,7 +855,8 @@ func (s *PublicBlockChainQuaiAPI) EstimateGas(ctx context.Context, args Transact
 		if err != nil {
 			return 0, err
 		}
-		estimatedQiAmount := misc.QuaiToQi(header, args.Value.ToInt())
+		primeTerminus := s.b.GetBlockByHash(header.PrimeTerminusHash())
+		estimatedQiAmount := misc.QuaiToQi(header, primeTerminus.ExchangeRate(), header.Difficulty(), args.Value.ToInt())
 		usedGas := uint64(0)
 
 		usedGas += params.TxGas
@@ -902,7 +929,11 @@ func (s *PublicBlockChainQuaiAPI) BaseFee(ctx context.Context, txType bool) (*he
 		return (*hexutil.Big)(s.b.CurrentBlock().BaseFee()), nil
 	} else {
 		quaiBaseFee := s.b.CurrentBlock().BaseFee()
-		qiBaseFee := misc.QuaiToQi(header, quaiBaseFee)
+		primeTerminus := s.b.GetBlockByHash(s.b.CurrentBlock().PrimeTerminusHash())
+		if primeTerminus == nil {
+			return nil, errors.New("prime terminus not found")
+		}
+		qiBaseFee := misc.QuaiToQi(header, primeTerminus.ExchangeRate(), header.Difficulty(), quaiBaseFee)
 		if qiBaseFee.Cmp(big.NewInt(0)) == 0 {
 			// Minimum base fee is 1 qit or smallest unit
 			return (*hexutil.Big)(types.Denominations[0]), nil
@@ -932,9 +963,18 @@ func (s *PublicBlockChainQuaiAPI) EstimateFeeForQi(ctx context.Context, args Tra
 	}
 
 	// Calculate the base fee
-	minGasPrice := s.b.GetMinGasPrice()
-	feeInQuai := new(big.Int).Mul(new(big.Int).SetUint64(uint64(gas)), minGasPrice)
-	feeInQi := misc.QuaiToQi(header, feeInQuai)
+	currentBaseFee := s.b.CurrentBlock().BaseFee()
+	// increase the base fee by 20% to account for the change in difficulty
+	currentBaseFee = new(big.Int).Mul(currentBaseFee, big.NewInt(120))
+	currentBaseFee = new(big.Int).Div(currentBaseFee, big.NewInt(100))
+	feeInQuai := new(big.Int).Mul(new(big.Int).SetUint64(uint64(gas)), currentBaseFee)
+
+	primeTerminus := s.b.GetBlockByHash(s.b.CurrentBlock().PrimeTerminusHash())
+	if primeTerminus == nil {
+		return nil, errors.New("cannot find prime terminus for the current block")
+	}
+	exchangeRate := primeTerminus.ExchangeRate()
+	feeInQi := misc.QuaiToQi(header, exchangeRate, header.Difficulty(), feeInQuai)
 	if feeInQi.Cmp(big.NewInt(0)) == 0 {
 		// Minimum fee is 1 qit or smallest unit
 		return (*hexutil.Big)(types.Denominations[0]), nil
@@ -1129,6 +1169,7 @@ func (s *PublicBlockChainQuaiAPI) ReceiveMinedHeader(ctx context.Context, raw he
 	s.b.Logger().WithFields(log.Fields{
 		"number":   block.Number(s.b.NodeCtx()),
 		"location": block.Location(),
+		"hash":     block.Hash(),
 	}).Info("Received mined header")
 
 	return nil
@@ -1180,13 +1221,17 @@ func (s *PublicBlockChainQuaiAPI) ReceiveWorkShare(ctx context.Context, workShar
 		}
 		if pendingBlockBody == nil {
 			s.b.Logger().Warn("Could not get the pending Block body", "err", err)
-			return nil
+			return err
 		}
 		wo := types.NewWorkObject(workShare, pendingBlockBody.Body(), nil)
 		shareView := wo.ConvertToWorkObjectShareView(txs)
 		err = s.b.BroadcastWorkShare(shareView, s.b.NodeLocation())
 		if err != nil {
-			s.b.Logger().WithField("err", err).Error("Error broadcasting work share")
+			s.b.Logger().WithFields(log.Fields{
+				"hash": shareView.Hash(),
+				"err":  err,
+			}).Error("Error broadcasting work share")
+			return err
 		}
 		txEgressCounter.Add(float64(len(shareView.WorkObject.Transactions())))
 		s.b.Logger().WithFields(log.Fields{"tx count": len(txs)}).Info("Broadcasted workshares with txs")
@@ -1228,7 +1273,7 @@ func (s *PublicBlockChainQuaiAPI) GetProtocolExpansionNumber() hexutil.Uint {
 }
 
 // Calculate the amount of Quai that Qi can be converted to. Expect the current Header and the Qi amount in "qits", returns the quai amount in "its"
-func (s *PublicBlockChainQuaiAPI) QiRateAtBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash, qiAmount hexutil.Big) *hexutil.Big {
+func (s *PublicBlockChainQuaiAPI) QiToQuai(ctx context.Context, qiAmount hexutil.Big, blockNrOrHash rpc.BlockNumberOrHash) *hexutil.Big {
 	var header *types.WorkObject
 	var err error
 	if blockNr, ok := blockNrOrHash.Number(); ok {
@@ -1248,11 +1293,16 @@ func (s *PublicBlockChainQuaiAPI) QiRateAtBlock(ctx context.Context, blockNrOrHa
 	} else if header == nil {
 		return nil
 	}
-	return (*hexutil.Big)(misc.QiToQuai(header, qiAmount.ToInt()))
+	primeTerminus := s.b.GetBlockByHash(header.PrimeTerminusHash())
+	if primeTerminus == nil {
+		return nil
+	} else {
+		return (*hexutil.Big)(misc.QiToQuai(header, primeTerminus.ExchangeRate(), primeTerminus.MinerDifficulty(), qiAmount.ToInt()))
+	}
 }
 
 // Calculate the amount of Qi that Quai can be converted to. Expect the current Header and the Quai amount in "its", returns the Qi amount in "qits"
-func (s *PublicBlockChainQuaiAPI) QuaiRateAtBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash, quaiAmount hexutil.Big) *hexutil.Big {
+func (s *PublicBlockChainQuaiAPI) QuaiToQi(ctx context.Context, quaiAmount hexutil.Big, blockNrOrHash rpc.BlockNumberOrHash) *hexutil.Big {
 	var header *types.WorkObject
 	var err error
 	if blockNr, ok := blockNrOrHash.Number(); ok {
@@ -1272,7 +1322,12 @@ func (s *PublicBlockChainQuaiAPI) QuaiRateAtBlock(ctx context.Context, blockNrOr
 	} else if header == nil {
 		return nil
 	}
-	return (*hexutil.Big)(misc.QuaiToQi(header, quaiAmount.ToInt()))
+	primeTerminus := s.b.GetBlockByHash(s.b.CurrentBlock().PrimeTerminusHash())
+	if primeTerminus == nil {
+		return nil
+	} else {
+		return (*hexutil.Big)(misc.QuaiToQi(header, primeTerminus.ExchangeRate(), primeTerminus.MinerDifficulty(), quaiAmount.ToInt()))
+	}
 }
 
 func (s *PublicBlockChainQuaiAPI) CalcOrder(ctx context.Context, raw hexutil.Bytes) (hexutil.Uint, error) {
@@ -1315,4 +1370,106 @@ func (s *PublicBlockChainQuaiAPI) SetWorkShareP2PThreshold(ctx context.Context, 
 	s.b.SetWorkShareP2PThreshold(int(threshold))
 
 	return nil
+}
+
+func (s *PublicBlockChainQuaiAPI) GetKQuaiAndUpdateBit(ctx context.Context, blockHash common.Hash) (map[string]interface{}, error) {
+	if !s.b.NodeLocation().Equal(common.Location{0, 0}) {
+		return nil, errors.New("cannot call GetKQuaiAndUpdateBit in any other chain than cyprus-1")
+	}
+
+	kQuai, updateBit, err := s.b.GetKQuaiAndUpdateBit(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	fields := make(map[string]interface{})
+	fields["kQuai"] = kQuai.String()
+	fields["updateBit"] = updateBit
+
+	return fields, nil
+}
+
+// GetTransactionReceipt returns the transaction receipt for the given transaction hash.
+// Moved from PublicTransactionPoolAPI
+// quai_getTransactionReceipt
+func (s *PublicBlockChainQuaiAPI) GetTransactionReceipt(ctx context.Context, hash common.Hash) (map[string]interface{}, error) {
+	tx, blockHash, blockNumber, index, err := s.b.GetTransaction(ctx, hash)
+	if err != nil {
+		return nil, nil
+	}
+	receipts, err := s.b.GetReceipts(ctx, blockHash)
+	if err != nil {
+		return nil, err
+	}
+	receipt := &types.Receipt{}
+	for _, r := range receipts {
+		if r.TxHash == hash {
+			receipt = r
+		}
+	}
+
+	fields := map[string]interface{}{
+		"blockHash":         blockHash,
+		"blockNumber":       hexutil.Uint64(blockNumber),
+		"transactionHash":   hash,
+		"transactionIndex":  hexutil.Uint64(index),
+		"gasUsed":           hexutil.Uint64(receipt.GasUsed),
+		"cumulativeGasUsed": hexutil.Uint64(receipt.CumulativeGasUsed),
+		"contractAddress":   nil,
+		"logs":              receipt.Logs,
+		"logsBloom":         receipt.Bloom,
+		"type":              hexutil.Uint(tx.Type()),
+	}
+
+	if tx.Type() == types.QuaiTxType {
+		if to := tx.To(); to != nil {
+			fields["to"] = to.Hex()
+		}
+		// Derive the sender.
+		bigblock := new(big.Int).SetUint64(blockNumber)
+		signer := types.MakeSigner(s.b.ChainConfig(), bigblock)
+		from, _ := types.Sender(signer, tx)
+		fields["from"] = from.Hex()
+
+	}
+
+	if tx.Type() == types.ExternalTxType {
+		fields["originatingTxHash"] = tx.OriginatingTxHash()
+		fields["etxType"] = hexutil.Uint(tx.EtxType())
+	}
+
+	var outBoundEtxs []*RPCTransaction
+	for _, tx := range receipt.OutboundEtxs {
+		outBoundEtxs = append(outBoundEtxs, newRPCTransaction(tx, blockHash, blockNumber, index, big.NewInt(0), s.b.NodeLocation()))
+	}
+	if len(receipt.OutboundEtxs) > 0 {
+		fields["outboundEtxs"] = outBoundEtxs
+	}
+	// Assign the effective gas price paid
+	header, err := s.b.HeaderByHash(ctx, blockHash)
+	if err != nil {
+		return nil, err
+	}
+	if tx.Type() == types.QuaiTxType {
+		gasPrice := new(big.Int).Set(tx.GasPrice())
+		fields["effectiveGasPrice"] = hexutil.Uint64(gasPrice.Uint64())
+	} else {
+		// QiTx
+		fields["effectiveGasPrice"] = hexutil.Uint64(header.BaseFee().Uint64())
+	}
+
+	// Assign receipt status or post state.
+	if len(receipt.PostState) > 0 {
+		fields["root"] = hexutil.Bytes(receipt.PostState)
+	} else {
+		fields["status"] = hexutil.Uint(receipt.Status)
+	}
+	if receipt.Logs == nil {
+		fields["logs"] = [][]*types.Log{}
+	}
+	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
+	if !receipt.ContractAddress.Equal(common.Zero) && !receipt.ContractAddress.Equal(common.Address{}) {
+		fields["contractAddress"] = receipt.ContractAddress.Hex()
+	}
+	return fields, nil
 }

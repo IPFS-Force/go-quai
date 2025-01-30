@@ -61,8 +61,13 @@ func headerTestData() (*Header, common.Hash) {
 		stateLimit:               1234567,
 		stateUsed:                1234567,
 		exchangeRate:             big.NewInt(123456789),
-		quaiToQi:                 big.NewInt(123456789),
-		qiToQuai:                 big.NewInt(123456789),
+		avgTxFees:                big.NewInt(1000000),
+		totalFees:                big.NewInt(1432323123),
+		kQuaiDiscount:            big.NewInt(123456),
+		conversionFlowAmount:     big.NewInt(123456),
+		minerDifficulty:          big.NewInt(1234899),
+		primeStateRoot:           common.HexToHash("0xcdef0123456789abcdef0123456789abcdef0123456789abcdefb"),
+		regionStateRoot:          common.HexToHash("0xcdef0123456789abcdef0123456789abcdef0123456789abcdefb"),
 	}
 
 	return header, header.Hash()
@@ -70,7 +75,7 @@ func headerTestData() (*Header, common.Hash) {
 
 func TestHeaderHash(t *testing.T) {
 	_, hash := headerTestData()
-	correctHash := common.HexToHash("0x708a539748c808aa9c7c706c2828ebe802bad88f95980fd7eda2d6c453c78847")
+	correctHash := common.HexToHash("0x900c189590b1d12744cf9bdf760d0ed92f8862b87b0479e701a656f926dfa34f")
 	require.Equal(t, correctHash, hash, "Hash not equal to expected hash")
 }
 
@@ -331,14 +336,40 @@ func FuzzHeaderExchangeRate(f *testing.F) {
 		func(h *Header, bi *big.Int) { h.exchangeRate = bi })
 }
 
-func FuzzHeaderQuaiToQi(f *testing.F) {
+func FuzzHeaderAvgTxFees(f *testing.F) {
 	fuzzHeaderBigIntHash(f,
-		func(h *Header) *big.Int { return h.quaiToQi },
-		func(h *Header, bi *big.Int) { h.quaiToQi = bi })
+		func(h *Header) *big.Int { return h.avgTxFees },
+		func(h *Header, bi *big.Int) { h.avgTxFees = bi })
 }
 
-func FuzzHeaderQiToQuai(f *testing.F) {
+func FuzzHeaderTotalFees(f *testing.F) {
 	fuzzHeaderBigIntHash(f,
-		func(h *Header) *big.Int { return h.qiToQuai },
-		func(h *Header, bi *big.Int) { h.qiToQuai = bi })
+		func(h *Header) *big.Int { return h.totalFees },
+		func(h *Header, bi *big.Int) { h.totalFees = bi })
+}
+
+func FuzzHeaderKQuaiDiscount(f *testing.F) {
+	fuzzHeaderBigIntHash(f,
+		func(h *Header) *big.Int { return h.kQuaiDiscount },
+		func(h *Header, bi *big.Int) { h.kQuaiDiscount = bi })
+}
+
+func FuzzHeaderConversionFlowAmount(f *testing.F) {
+	fuzzHeaderBigIntHash(f,
+		func(h *Header) *big.Int { return h.conversionFlowAmount },
+		func(h *Header, bi *big.Int) { h.conversionFlowAmount = bi })
+}
+
+func FuzzHeaderMinerDifficulty(f *testing.F) {
+	fuzzHeaderBigIntHash(f,
+		func(h *Header) *big.Int { return h.minerDifficulty },
+		func(h *Header, bi *big.Int) { h.minerDifficulty = bi })
+}
+
+func FuzzHeaderPrimeStateRoot(f *testing.F) {
+	fuzzHeaderHash(f, func(h *Header) common.Hash { return h.primeStateRoot }, func(h *Header, hash common.Hash) { h.primeStateRoot = hash })
+}
+
+func FuzzHeaderRegionStateRoot(f *testing.F) {
+	fuzzHeaderHash(f, func(h *Header) common.Hash { return h.regionStateRoot }, func(h *Header, hash common.Hash) { h.regionStateRoot = hash })
 }

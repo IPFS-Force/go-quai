@@ -49,6 +49,7 @@ type WorkObjectHeader struct {
 	mixHash             common.Hash
 	time                uint64
 	nonce               BlockNonce
+	data                []byte
 	lock                uint8
 	PowHash             atomic.Value
 	PowDigest           atomic.Value
@@ -199,38 +200,8 @@ func (wo *WorkObject) PrimaryCoinbase() common.Address {
 	return wo.WorkObjectHeader().PrimaryCoinbase()
 }
 
-func (wo *WorkObject) QuaiCoinbase() (common.Address, error) {
-	// check if the primary coinbase is in Quai ledger
-	quai := wo.PrimaryCoinbase().IsInQuaiLedgerScope()
-	if quai {
-		return wo.PrimaryCoinbase(), nil
-	} else {
-		quai = wo.SecondaryCoinbase().IsInQuaiLedgerScope()
-		if quai {
-			return wo.SecondaryCoinbase(), nil
-		} else {
-			return common.Address{}, errors.New("block doesnt have a quai coinbase")
-		}
-	}
-}
-
-func (wo *WorkObject) QiCoinbase() (common.Address, error) {
-	// check if the primary coinbase is in Qi ledger
-	qi := wo.PrimaryCoinbase().IsInQiLedgerScope()
-	if qi {
-		return wo.PrimaryCoinbase(), nil
-	} else {
-		qi = wo.SecondaryCoinbase().IsInQiLedgerScope()
-		if qi {
-			return wo.SecondaryCoinbase(), nil
-		} else {
-			return common.Address{}, errors.New("block doesnt have a qi coinbase")
-		}
-	}
-}
-
-func (wo *WorkObject) SecondaryCoinbase() common.Address {
-	return wo.Body().Header().SecondaryCoinbase()
+func (wo *WorkObject) Data() []byte {
+	return wo.WorkObjectHeader().Data()
 }
 
 func (wo *WorkObject) MixHash() common.Hash {
@@ -408,12 +379,32 @@ func (wo *WorkObject) ExchangeRate() *big.Int {
 	return wo.Header().ExchangeRate()
 }
 
-func (wo *WorkObject) QuaiToQi() *big.Int {
-	return wo.Header().QuaiToQi()
+func (wo *WorkObject) AvgTxFees() *big.Int {
+	return wo.Header().AvgTxFees()
 }
 
-func (wo *WorkObject) QiToQuai() *big.Int {
-	return wo.Header().QiToQuai()
+func (wo *WorkObject) TotalFees() *big.Int {
+	return wo.Header().TotalFees()
+}
+
+func (wo *WorkObject) KQuaiDiscount() *big.Int {
+	return wo.Header().KQuaiDiscount()
+}
+
+func (wo *WorkObject) ConversionFlowAmount() *big.Int {
+	return wo.Header().ConversionFlowAmount()
+}
+
+func (wo *WorkObject) MinerDifficulty() *big.Int {
+	return wo.Header().MinerDifficulty()
+}
+
+func (wo *WorkObject) PrimeStateRoot() common.Hash {
+	return wo.Header().PrimeStateRoot()
+}
+
+func (wo *WorkObject) RegionStateRoot() common.Hash {
+	return wo.Header().RegionStateRoot()
 }
 
 func (wo *WorkObject) QiTransactions() []*Transaction {
@@ -435,20 +426,6 @@ func (wo *WorkObject) QiTransactionsWithoutCoinbase() []*Transaction {
 		}
 	}
 	return qiTxs
-}
-
-func (wo *WorkObject) TransactionsWithReceipts() []*Transaction {
-	txs := make([]*Transaction, 0)
-	for _, t := range wo.Transactions() {
-		if IsCoinBaseTx(t) {
-			// ignore the coinbase tx
-			continue
-		}
-		if !IsConversionTx(t) && (t.Type() == QuaiTxType || (t.Type() == ExternalTxType && t.To().IsInQuaiLedgerScope())) {
-			txs = append(txs, t)
-		}
-	}
-	return txs
 }
 
 func (wo *WorkObject) TransactionsInfo() map[string]interface{} {
@@ -536,11 +513,6 @@ func (wo *WorkObject) SetNumber(val *big.Int, nodeCtx int) {
 	}
 }
 
-func (wo *WorkObject) SetCoinbases(primary common.Address, secondary common.Address) {
-	wo.WorkObjectHeader().SetPrimaryCoinbase(primary)
-	wo.Header().SetSecondaryCoinbase(secondary)
-}
-
 ////////////////////////////////////////////////////////////
 /////////////////// Work Object Header Getters ///////////////
 ////////////////////////////////////////////////////////////
@@ -601,6 +573,10 @@ func (wh *WorkObjectHeader) Time() uint64 {
 	return wh.time
 }
 
+func (wh *WorkObjectHeader) Data() []byte {
+	return wh.data
+}
+
 ////////////////////////////////////////////////////////////
 /////////////////// Work Object Header Setters ///////////////
 ////////////////////////////////////////////////////////////
@@ -651,6 +627,10 @@ func (wh *WorkObjectHeader) SetLock(lock uint8) {
 
 func (wh *WorkObjectHeader) SetTime(val uint64) {
 	wh.time = val
+}
+
+func (wh *WorkObjectHeader) SetData(val []byte) {
+	wh.data = val
 }
 
 type WorkObjectBody struct {
@@ -856,7 +836,7 @@ func NewWorkObjectBody(header *Header, txs []*Transaction, etxs []*Transaction, 
 }
 
 func NewWorkObjectWithHeader(header *WorkObject, tx *Transaction, nodeCtx int, woType WorkObjectView) *WorkObject {
-	woHeader := NewWorkObjectHeader(header.Hash(), header.ParentHash(common.ZONE_CTX), header.WorkObjectHeader().number, header.WorkObjectHeader().difficulty, header.WorkObjectHeader().PrimeTerminusNumber(), header.WorkObjectHeader().txHash, header.WorkObjectHeader().nonce, header.WorkObjectHeader().lock, header.WorkObjectHeader().time, header.Location(), header.PrimaryCoinbase())
+	woHeader := NewWorkObjectHeader(header.Hash(), header.ParentHash(common.ZONE_CTX), header.WorkObjectHeader().number, header.WorkObjectHeader().difficulty, header.WorkObjectHeader().PrimeTerminusNumber(), header.WorkObjectHeader().txHash, header.WorkObjectHeader().nonce, header.WorkObjectHeader().lock, header.WorkObjectHeader().time, header.Location(), header.PrimaryCoinbase(), header.WorkObjectHeader().data)
 	woBody, _ := NewWorkObjectBody(header.Body().Header(), nil, nil, nil, nil, nil, nil, nodeCtx)
 	return NewWorkObject(woHeader, woBody, tx)
 }
@@ -1030,7 +1010,7 @@ func (wo *WorkObject) ProtoDecode(data *ProtoWorkObject, location common.Locatio
 	return nil
 }
 
-func NewWorkObjectHeader(headerHash common.Hash, parentHash common.Hash, number *big.Int, difficulty *big.Int, primeTerminusNumber *big.Int, txHash common.Hash, nonce BlockNonce, lock uint8, time uint64, location common.Location, primaryCoinbase common.Address) *WorkObjectHeader {
+func NewWorkObjectHeader(headerHash common.Hash, parentHash common.Hash, number *big.Int, difficulty *big.Int, primeTerminusNumber *big.Int, txHash common.Hash, nonce BlockNonce, lock uint8, time uint64, location common.Location, primaryCoinbase common.Address, data []byte) *WorkObjectHeader {
 	return &WorkObjectHeader{
 		headerHash:          headerHash,
 		parentHash:          parentHash,
@@ -1043,6 +1023,7 @@ func NewWorkObjectHeader(headerHash common.Hash, parentHash common.Hash, number 
 		time:                time,
 		location:            location,
 		primaryCoinbase:     primaryCoinbase,
+		data:                data,
 	}
 }
 
@@ -1060,6 +1041,7 @@ func CopyWorkObjectHeader(wh *WorkObjectHeader) *WorkObjectHeader {
 	cpy.SetPrimeTerminusNumber(wh.primeTerminusNumber)
 	cpy.SetLock(wh.Lock())
 	cpy.SetPrimaryCoinbase(wh.PrimaryCoinbase())
+	cpy.SetData(wh.Data())
 	return &cpy
 }
 
@@ -1077,6 +1059,7 @@ func (wh *WorkObjectHeader) RPCMarshalWorkObjectHeader() map[string]interface{} 
 		"mixHash":             wh.MixHash(),
 		"lock":                hexutil.Uint64(wh.Lock()),
 		"primaryCoinbase":     wh.PrimaryCoinbase().Hex(),
+		"data":                hexutil.Bytes(wh.Data()),
 	}
 	return result
 }
@@ -1123,6 +1106,7 @@ func (wh *WorkObjectHeader) SealEncode() *ProtoWorkObjectHeader {
 	time := wh.Time()
 	lock := uint32(wh.Lock())
 	coinbase := common.ProtoAddress{Value: wh.PrimaryCoinbase().Bytes()}
+	data := wh.Data()
 
 	return &ProtoWorkObjectHeader{
 		HeaderHash:          &headerHash,
@@ -1135,6 +1119,7 @@ func (wh *WorkObjectHeader) SealEncode() *ProtoWorkObjectHeader {
 		Lock:                &lock,
 		PrimaryCoinbase:     &coinbase,
 		Time:                &time,
+		Data:                data,
 	}
 }
 
@@ -1150,6 +1135,7 @@ func (wh *WorkObjectHeader) ProtoEncode() (*ProtoWorkObjectHeader, error) {
 	mixHash := common.ProtoHash{Value: wh.MixHash().Bytes()}
 	lock := uint32(wh.Lock())
 	coinbase := common.ProtoAddress{Value: wh.PrimaryCoinbase().Bytes()}
+	data := wh.Data()
 
 	return &ProtoWorkObjectHeader{
 		HeaderHash:          &hash,
@@ -1164,6 +1150,7 @@ func (wh *WorkObjectHeader) ProtoEncode() (*ProtoWorkObjectHeader, error) {
 		MixHash:             &mixHash,
 		Time:                &wh.time,
 		PrimaryCoinbase:     &coinbase,
+		Data:                data,
 	}, nil
 }
 
@@ -1184,6 +1171,7 @@ func (wh *WorkObjectHeader) ProtoDecode(data *ProtoWorkObjectHeader, location co
 	wh.SetMixHash(common.BytesToHash(data.GetMixHash().Value))
 	wh.SetTime(data.GetTime())
 	wh.SetPrimaryCoinbase(common.BytesToAddress(data.GetPrimaryCoinbase().GetValue(), location))
+	wh.SetData(data.GetData())
 
 	return nil
 }

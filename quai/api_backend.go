@@ -293,7 +293,7 @@ func (b *QuaiAPIBackend) GetEVM(ctx context.Context, msg core.Message, state *st
 	if err != nil {
 		return nil, vmError, err
 	}
-	return vm.NewEVM(context, txContext, state, b.quai.core.Config(), *vmConfig), vmError, nil
+	return vm.NewEVM(context, txContext, state, b.quai.core.Config(), *vmConfig, nil), vmError, nil
 }
 
 func (b *QuaiAPIBackend) SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription {
@@ -414,8 +414,8 @@ func (b *QuaiAPIBackend) SendTxToSharingClients(tx *types.Transaction) {
 	b.quai.core.SendTxToSharingClients(tx)
 }
 
-func (b *QuaiAPIBackend) GetMinGasPrice() *big.Int {
-	return b.quai.core.GetMinGasPrice()
+func (b *QuaiAPIBackend) GetRollingFeeInfo() (min, max, avg *big.Int) {
+	return b.quai.core.GetRollingFeeInfo()
 }
 
 func (b *QuaiAPIBackend) GetPoolGasPrice() *big.Int {
@@ -743,6 +743,18 @@ func (b *QuaiAPIBackend) GeneratePendingHeader(block *types.WorkObject, fill boo
 
 func (b *QuaiAPIBackend) MakeFullPendingHeader(primePh, regionPh, zonePh *types.WorkObject) *types.WorkObject {
 	return b.quai.core.MakeFullPendingHeader(primePh, regionPh, zonePh)
+}
+
+func (b *QuaiAPIBackend) CalcBaseFee(wo *types.WorkObject) *big.Int {
+	return b.quai.core.CalcBaseFee(wo)
+}
+
+func (b *QuaiAPIBackend) GetKQuaiAndUpdateBit(blockHash common.Hash) (*big.Int, uint8, error) {
+	return b.quai.core.GetKQuaiAndUpdateBit(blockHash)
+}
+
+func (b *QuaiAPIBackend) ComputeMinerDifficulty(parent *types.WorkObject) *big.Int {
+	return b.quai.core.ComputeMinerDifficulty(parent)
 }
 
 // ///////////////////////////

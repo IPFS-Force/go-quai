@@ -38,10 +38,14 @@ message ProtoHeader {
   optional uint64 state_limit = 30;
   optional uint64 state_used = 31;
   optional bytes quai_state_size = 32;
-  optional bytes secondary_coinbase = 33;
-  optional bytes exchange_rate = 34;
-  optional bytes quai_to_qi = 35;
-  optional bytes qi_to_quai = 36;
+  optional bytes exchange_rate = 33;
+  optional bytes avg_tx_fees = 35;
+  optional bytes total_fees = 36;
+  optional bytes k_quai_discount = 37;
+  optional bytes conversion_flow_amount = 38;
+  optional bytes miner_difficulty = 39;
+  optional common.ProtoHash prime_state_root = 40;
+  optional common.ProtoHash region_state_root = 41;
 }
 
 message ProtoTransaction {
@@ -52,22 +56,21 @@ message ProtoTransaction {
   optional uint64 gas = 5;
   optional bytes data = 6;
   optional bytes chain_id = 7;
-  optional bytes miner_tip = 8;
-  optional bytes gas_price = 9;
-  optional ProtoAccessList access_list = 10;
-  optional bytes v = 11;
-  optional bytes r = 12;
-  optional bytes s = 13;
-  optional common.ProtoHash originating_tx_hash = 14;
-  optional uint32 etx_index = 15;
-  optional ProtoTxIns tx_ins = 16;
-  optional ProtoTxOuts tx_outs = 17;
-  optional bytes signature = 18;
-  optional bytes etx_sender = 19;
-  optional common.ProtoHash parent_hash = 20;
-  optional common.ProtoHash mix_hash = 21;
-  optional uint64 work_nonce = 22;
-  optional uint64 etx_type = 23;
+  optional bytes gas_price = 8;
+  optional ProtoAccessList access_list = 9;
+  optional bytes v = 10;
+  optional bytes r = 11;
+  optional bytes s = 12;
+  optional common.ProtoHash originating_tx_hash = 13;
+  optional uint32 etx_index = 14;
+  optional ProtoTxIns tx_ins = 15;
+  optional ProtoTxOuts tx_outs = 16;
+  optional bytes signature = 17;
+  optional bytes etx_sender = 18;
+  optional common.ProtoHash parent_hash = 19;
+  optional common.ProtoHash mix_hash = 20;
+  optional uint64 work_nonce = 21;
+  optional uint64 etx_type = 22;
 }
 
 message ProtoTransactions { repeated ProtoTransaction transactions = 1; }
@@ -91,6 +94,7 @@ message ProtoWorkObjectHeader {
   optional bytes prime_terminus_number = 10;
   optional uint32 lock = 11;
   optional common.ProtoAddress primary_coinbase = 12;
+  bytes data = 13;
 }
 
 message ProtoWorkObjectHeaders {
@@ -220,6 +224,14 @@ message ProtoSpentUTXOs {
 }
 message ProtoKeys {
   repeated bytes keys = 1;
+}
+
+message ProtoKeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+message ProtoKeysAndValues {
+  repeated ProtoKeyValue keys_and_values = 1;
 }
 
 message ProtoTrimDepths {

@@ -157,9 +157,6 @@ func (v *BlockValidator) SanityCheckWorkObjectBlockViewBody(wo *types.WorkObject
 			}
 		}
 	} else {
-		if wo.GasLimit() < params.MinGasLimit(wo.NumberU64(common.ZONE_CTX)) {
-			return fmt.Errorf("zone gas limit is less than the required gas limit")
-		}
 		if len(wo.Manifest()) != 0 {
 			return fmt.Errorf("zone body has non zero manifests")
 		}
@@ -175,6 +172,9 @@ func (v *BlockValidator) SanityCheckWorkObjectBlockViewBody(wo *types.WorkObject
 		// The header view should have the etxs populated
 		if hash := types.DeriveSha(wo.OutboundEtxs(), trie.NewStackTrie(nil)); hash != header.OutboundEtxHash() {
 			return fmt.Errorf("outbound transaction hash mismatch: have %x, want %x", hash, header.OutboundEtxHash())
+		}
+		if wo.PrimaryCoinbase().IsInQiLedgerScope() && wo.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("work object primary coinbase is in qi ledger scope before controller kick in block")
 		}
 	}
 	return nil
@@ -281,9 +281,6 @@ func (v *BlockValidator) SanityCheckWorkObjectHeaderViewBody(wo *types.WorkObjec
 			}
 		}
 	} else {
-		if wo.GasLimit() < params.MinGasLimit(wo.NumberU64(common.ZONE_CTX)) {
-			return fmt.Errorf("zone gas limit is less than the required gas limit")
-		}
 		// Transactions, SubManifestHash, InterlinkHashes should be nil in the workshare in Zone context
 		if len(wo.Transactions()) != 0 {
 			return fmt.Errorf("zone body has non zero transactions")
@@ -297,6 +294,9 @@ func (v *BlockValidator) SanityCheckWorkObjectHeaderViewBody(wo *types.WorkObjec
 		// The header view should have the etxs populated
 		if hash := types.DeriveSha(wo.OutboundEtxs(), trie.NewStackTrie(nil)); hash != header.OutboundEtxHash() {
 			return fmt.Errorf("outbound transaction hash mismatch: have %x, want %x", hash, header.OutboundEtxHash())
+		}
+		if wo.PrimaryCoinbase().IsInQiLedgerScope() && wo.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("work object primary coinbase is in qi ledger scope before controller kick in block")
 		}
 	}
 
@@ -315,6 +315,10 @@ func (v *BlockValidator) SanityCheckWorkObjectShareViewBody(wo *types.WorkObject
 	}
 	if wo.WorkObjectHeader() == nil {
 		return fmt.Errorf("work object header is nil")
+	}
+	// Lockup byte for the first two months has to be zero
+	if wo.WorkObjectHeader().NumberU64() < 2*params.BlocksPerMonth && wo.WorkObjectHeader().Lock() != 0 {
+		return fmt.Errorf("work object header has invalid lockup byte")
 	}
 	if wo.Header() == nil {
 		return fmt.Errorf("wo header is nil")
@@ -335,6 +339,9 @@ func (v *BlockValidator) SanityCheckWorkObjectShareViewBody(wo *types.WorkObject
 	// check if the txs in the workObject hash to the tx hash in the body header
 	if hash := types.DeriveSha(wo.Transactions(), trie.NewStackTrie(nil)); hash != wo.TxHash() {
 		return fmt.Errorf("transaction root hash mismatch: have %x, want %x", hash, wo.TxHash())
+	}
+	if wo.PrimaryCoinbase().IsInQiLedgerScope() && wo.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+		return fmt.Errorf("work object primary coinbase is in qi ledger scope before controller kick in block")
 	}
 
 	return nil
@@ -411,31 +418,21 @@ func CalcGasLimit(parent *types.WorkObject, gasCeil uint64) uint64 {
 		return 0
 	}
 
+	minGasLimit := params.MinGasLimit(parent.NumberU64(common.ZONE_CTX))
 	// If parent gas is zero and we have passed the 5 day threshold, we can set the first block gas limit to min gas limit
 	if parent.GasLimit() == 0 {
-		return params.MinGasLimit(parent.NumberU64(common.ZONE_CTX))
+		return minGasLimit
 	}
 
-	parentGasLimit := parent.GasLimit()
-
-	delta := parentGasLimit/params.GasLimitBoundDivisor - 1
-	limit := parentGasLimit
-
-	var desiredLimit uint64
-	percentGasUsed := parent.GasUsed() * 100 / parent.GasLimit()
-	if percentGasUsed > params.PercentGasUsedThreshold {
-		desiredLimit = gasCeil
-		if limit+delta > desiredLimit {
-			return desiredLimit
-		} else {
-			return limit + delta
+	//  For the first two months increment the gas limit slowly, then just
+	//  return the max gas limit
+	if parent.NumberU64(common.ZONE_CTX) < 2*params.BlocksPerMonth {
+		gasLimit := (parent.NumberU64(common.ZONE_CTX) * gasCeil) / (2 * params.BlocksPerMonth)
+		if gasLimit < minGasLimit {
+			return minGasLimit
 		}
+		return gasLimit
 	} else {
-		desiredLimit = params.MinGasLimit(parent.NumberU64(common.ZONE_CTX))
-		if limit-delta/2 < desiredLimit {
-			return desiredLimit
-		} else {
-			return limit - delta/2
-		}
+		return gasCeil
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/dominant-strategies/go-quai/core/rawdb"
 	"github.com/dominant-strategies/go-quai/core/state"
 	"github.com/dominant-strategies/go-quai/core/types"
+	"github.com/dominant-strategies/go-quai/core/vm"
 	"github.com/dominant-strategies/go-quai/crypto/multiset"
 	"github.com/dominant-strategies/go-quai/ethdb"
 	"github.com/dominant-strategies/go-quai/log"
@@ -215,6 +216,9 @@ func (blake3pow *Blake3pow) VerifyUncles(chain consensus.ChainReader, block *typ
 		if ancestors[uncle.ParentHash()] == nil || (!workShare && (uncle.ParentHash() == block.ParentHash(nodeCtx))) {
 			return consensus.ErrDanglingUncle
 		}
+		if uncle.PrimaryCoinbase().IsInQiLedgerScope() && block.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("uncle inclusion is not allowed before block %v", params.ControllerKickInBlock)
+		}
 
 		// make sure that the work can be computed
 		_, err = blake3pow.ComputePowHash(uncle)
@@ -225,6 +229,9 @@ func (blake3pow *Blake3pow) VerifyUncles(chain consensus.ChainReader, block *typ
 		_, err = chain.WorkShareDistance(block, uncle)
 		if err != nil {
 			return err
+		}
+		if uncle.NumberU64() < 2*params.BlocksPerMonth && uncle.Lock() != 0 {
+			return fmt.Errorf("workshare lock byte: %v is not valid: it has to be %v for the first two months", uncle.Lock(), 0)
 		}
 
 		// Verify the block's difficulty based on its timestamp and parent's difficulty
@@ -386,6 +393,25 @@ func (blake3pow *Blake3pow) verifyHeader(chain consensus.ChainHeaderReader, head
 		}
 	}
 
+	if nodeCtx == common.PRIME_CTX {
+		if header.PrimeStateRoot() != types.EmptyRootHash {
+			return fmt.Errorf("invalid prime state root: have %v, want %v", header.PrimeStateRoot(), types.EmptyRootHash)
+		}
+	}
+
+	if nodeCtx == common.REGION_CTX {
+		if header.RegionStateRoot() != types.EmptyRootHash {
+			return fmt.Errorf("invalid region state root: have %v, want %v", header.RegionStateRoot(), types.EmptyRootHash)
+		}
+	}
+
+	if nodeCtx == common.PRIME_CTX {
+		expectedMinerDifficulty := chain.ComputeMinerDifficulty(parent)
+		if header.MinerDifficulty().Cmp(expectedMinerDifficulty) != 0 {
+			return fmt.Errorf("invalid miner difficulty: have %v, want %v", header.MinerDifficulty(), expectedMinerDifficulty)
+		}
+	}
+
 	if nodeCtx == common.ZONE_CTX {
 		var expectedExpansionNumber uint8
 		expectedExpansionNumber, err := chain.ComputeExpansionNumber(parent)
@@ -395,6 +421,9 @@ func (blake3pow *Blake3pow) verifyHeader(chain consensus.ChainHeaderReader, head
 		if header.ExpansionNumber() != expectedExpansionNumber {
 			return fmt.Errorf("invalid expansion number: have %v, want %v", header.ExpansionNumber(), expectedExpansionNumber)
 		}
+		if header.PrimaryCoinbase().IsInQiLedgerScope() && header.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock {
+			return fmt.Errorf("Qi coinbase is not allowed before block %v", params.ControllerKickInBlock)
+		}
 	}
 
 	if nodeCtx == common.ZONE_CTX {
@@ -403,20 +432,8 @@ func (blake3pow *Blake3pow) verifyHeader(chain consensus.ChainHeaderReader, head
 		if err != nil {
 			return fmt.Errorf("out-of-scope primary coinbase in the header: %v location: %v nodeLocation: %v, err %s", header.PrimaryCoinbase(), header.Location(), blake3pow.config.NodeLocation, err)
 		}
-		_, err = header.SecondaryCoinbase().InternalAddress()
-		if err != nil {
-			return fmt.Errorf("out-of-scope secondary coinbase in the header: %v location: %v nodeLocation: %v, err %s", header.SecondaryCoinbase(), header.Location(), blake3pow.config.NodeLocation, err)
-		}
-		// One of the coinbases has to be Quai and the other one has to be Qi
-		quaiAddress := header.PrimaryCoinbase().IsInQuaiLedgerScope()
-		if quaiAddress {
-			if !header.SecondaryCoinbase().IsInQiLedgerScope() {
-				return fmt.Errorf("primary coinbase: %v is in quai ledger but secondary coinbase: %v is not in Qi ledger", header.PrimaryCoinbase(), header.SecondaryCoinbase())
-			}
-		} else {
-			if !header.SecondaryCoinbase().IsInQuaiLedgerScope() {
-				return fmt.Errorf("primary coinbase: %v is in qi ledger but secondary coinbase: %v is not in Quai ledger", header.PrimaryCoinbase(), header.SecondaryCoinbase())
-			}
+		if header.NumberU64(common.ZONE_CTX) < 2*params.BlocksPerMonth && header.Lock() != 0 {
+			return fmt.Errorf("header lock byte: %v is not valid: it has to be %v for the first two months", header.Lock(), 0)
 		}
 		// Verify that the gas limit is <= 2^63-1
 		cap := uint64(0x7fffffffffffffff)
@@ -443,19 +460,30 @@ func (blake3pow *Blake3pow) verifyHeader(chain consensus.ChainHeaderReader, head
 		if header.StateLimit() != expectedStateLimit {
 			return fmt.Errorf("invalid stateLimit: have %v, want %v, parentStateLimit %v", expectedStateLimit, header.StateLimit(), parent.StateLimit())
 		}
+		expectedBaseFee := chain.CalcBaseFee(parent)
+		if header.BaseFee().Cmp(expectedBaseFee) != 0 {
+			return fmt.Errorf("invalid baseFee: have %v, want %v, parentBaseFee %v", expectedBaseFee, header.BaseFee(), parent.BaseFee())
+		}
 		var expectedPrimeTerminusHash common.Hash
+		var expectedPrimeTerminusNumber *big.Int
 		_, parentOrder, _ := blake3pow.CalcOrder(chain, parent)
 		if parentOrder == common.PRIME_CTX {
 			expectedPrimeTerminusHash = parent.Hash()
+			expectedPrimeTerminusNumber = parent.Number(common.PRIME_CTX)
 		} else {
 			if chain.IsGenesisHash(parent.Hash()) {
 				expectedPrimeTerminusHash = parent.Hash()
+				expectedPrimeTerminusNumber = parent.Number(common.PRIME_CTX)
 			} else {
 				expectedPrimeTerminusHash = parent.PrimeTerminusHash()
+				expectedPrimeTerminusNumber = parent.PrimeTerminusNumber()
 			}
 		}
 		if header.PrimeTerminusHash() != expectedPrimeTerminusHash {
 			return fmt.Errorf("invalid primeTerminusHash: have %v, want %v", header.PrimeTerminusHash(), expectedPrimeTerminusHash)
+		}
+		if header.PrimeTerminusNumber().Cmp(expectedPrimeTerminusNumber) != 0 {
+			return fmt.Errorf("invalid primeTerminusNumber: have %v, want %v", header.PrimeTerminusNumber(), expectedPrimeTerminusNumber)
 		}
 	}
 	// Verify that the block number is parent's +1
@@ -597,7 +625,11 @@ func (blake3pow *Blake3pow) Finalize(chain consensus.ChainHeaderReader, batch et
 		multiSet = multiset.New()
 		alloc := core.ReadGenesisAlloc("genallocs/gen_alloc_quai_"+nodeLocation.Name()+".json", blake3pow.logger)
 		blake3pow.logger.WithField("alloc", len(alloc)).Info("Allocating genesis accounts")
-
+		internalLockupContract, err := vm.LockupContractAddresses[[2]byte{nodeLocation[0], nodeLocation[1]}].InternalAddress()
+		if err != nil {
+			return nil, 0, fmt.Errorf("Error getting internal address for lockup contract, err %s", err)
+		}
+		state.SetNonce(internalLockupContract, 1)
 		for addressString, account := range alloc {
 			addr := common.HexToAddress(addressString, nodeLocation)
 			internal, err := addr.InternalAddress()
@@ -730,7 +762,7 @@ func TrimBlock(chain consensus.ChainHeaderReader, batch ethdb.Batch, denominatio
 		}
 		// Only the coinbase and conversion txs are allowed to have lockups that
 		// is non zero
-		if utxo.Lock.Sign() == 0 {
+		if utxo.Lock.Sign() != 0 {
 			continue
 		}
 		txHash, index, err := rawdb.ReverseUtxoKey(key)

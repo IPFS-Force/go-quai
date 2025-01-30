@@ -54,13 +54,15 @@ const (
 	DefaultType = iota
 	CoinbaseType
 	ConversionType
+	CoinbaseLockupType
+	WrappingQiType
 )
 
 const (
-	c_MaxTxForSorting = 1500
+	c_MaxTxForSorting = 3000
 )
 
-// Transaction is a Quai transaction.
+// Transaction can be a Quai, Qi, or External transaction.
 type Transaction struct {
 	inner TxData    // Consensus contents of a transaction
 	time  time.Time // Time first seen locally (spam avoidance)
@@ -82,21 +84,26 @@ func NewTx(inner TxData) *Transaction {
 	return tx
 }
 
-func NewEmptyTx() *Transaction {
-	to := common.BytesToAddress([]byte{0x01}, common.Location{0, 0})
+func NewEmptyQuaiTx() *Transaction {
 	inner := &QuaiTx{
-		ChainID:    new(big.Int).SetUint64(1),
-		Nonce:      1,
-		MinerTip:   new(big.Int).SetUint64(0),
-		GasPrice:   new(big.Int).SetUint64(0),
-		Gas:        uint64(0),
-		To:         &to,
-		Value:      new(big.Int).SetUint64(0),
-		Data:       []byte{},
-		AccessList: AccessList{},
-		V:          new(big.Int).SetUint64(0),
-		R:          new(big.Int).SetUint64(0),
-		S:          new(big.Int).SetUint64(0),
+		ChainID:  new(big.Int),
+		Nonce:    *new(uint64),
+		GasPrice: new(big.Int),
+		Gas:      *new(uint64),
+		To:       &common.Address{},
+		Value:    new(big.Int),
+		Data:     []byte{},
+		AccessList: AccessList{AccessTuple{
+			Address:     common.Address{},
+			StorageKeys: []common.Hash{},
+		},
+		},
+		V:          new(big.Int),
+		R:          new(big.Int),
+		S:          new(big.Int),
+		ParentHash: &common.Hash{},
+		MixHash:    &common.Hash{},
+		WorkNonce:  &BlockNonce{},
 	}
 	return NewTx(inner)
 }
@@ -117,7 +124,6 @@ type TxData interface {
 	data() []byte
 	gas() uint64
 	gasPrice() *big.Int
-	minerTip() *big.Int
 	etxType() uint64
 	value() *big.Int
 	nonce() uint64
@@ -151,27 +157,26 @@ func (tx *Transaction) ProtoEncode() (*ProtoTransaction, error) {
 	// Other fields are set conditionally depending on tx type.
 	switch tx.Type() {
 	case QuaiTxType:
+		if tx.To() != nil {
+			protoTx.To = tx.To().Bytes()
+		}
 		nonce := tx.Nonce()
-		gas := tx.Gas()
 		protoTx.Nonce = &nonce
-		protoTx.Gas = &gas
-		protoTx.AccessList = tx.AccessList().ProtoEncode()
 		protoTx.Value = tx.Value().Bytes()
+		gas := tx.Gas()
+		protoTx.Gas = &gas
 		if tx.Data() == nil {
 			protoTx.Data = []byte{}
 		} else {
 			protoTx.Data = tx.Data()
 		}
-		if tx.To() != nil {
-			protoTx.To = tx.To().Bytes()
-		}
-		protoTx.MinerTip = tx.MinerTip().Bytes()
+		protoTx.ChainId = tx.ChainId().Bytes()
 		protoTx.GasPrice = tx.GasPrice().Bytes()
+		protoTx.AccessList = tx.AccessList().ProtoEncode()
 		V, R, S := tx.GetEcdsaSignatureValues()
 		protoTx.V = V.Bytes()
 		protoTx.R = R.Bytes()
 		protoTx.S = S.Bytes()
-		protoTx.ChainId = tx.ChainId().Bytes()
 		if tx.ParentHash() != nil {
 			protoTx.ParentHash = tx.ParentHash().ProtoEncode()
 		}
@@ -221,7 +226,11 @@ func (tx *Transaction) ProtoEncode() (*ProtoTransaction, error) {
 			workNonce := tx.WorkNonce().Uint64()
 			protoTx.WorkNonce = &workNonce
 		}
-
+		if tx.Data() == nil {
+			protoTx.Data = []byte{}
+		} else {
+			protoTx.Data = tx.Data()
+		}
 	}
 	return protoTx, nil
 }
@@ -235,7 +244,7 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 	txType := protoTx.GetType()
 
 	switch txType {
-	case 0:
+	case QuaiTxType:
 		if protoTx.Nonce == nil {
 			return errors.New("missing required field 'Nonce' in ProtoTransaction")
 		}
@@ -247,9 +256,6 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 		}
 		if protoTx.Value == nil {
 			return errors.New("missing required field 'Value' in ProtoTransaction")
-		}
-		if protoTx.MinerTip == nil {
-			return errors.New("missing required field 'MinerTip' in ProtoTransaction")
 		}
 		if protoTx.GasPrice == nil {
 			return errors.New("missing required field 'GasPrice' in ProtoTransaction")
@@ -271,7 +277,6 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 		}
 		quaiTx.ChainID = new(big.Int).SetBytes(protoTx.GetChainId())
 		quaiTx.Nonce = protoTx.GetNonce()
-		quaiTx.MinerTip = new(big.Int).SetBytes(protoTx.GetMinerTip())
 		quaiTx.GasPrice = new(big.Int).SetBytes(protoTx.GetGasPrice())
 		quaiTx.Gas = protoTx.GetGas()
 		if len(protoTx.GetValue()) == 0 {
@@ -318,7 +323,7 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 		}
 		tx.SetInner(&quaiTx)
 
-	case 1:
+	case ExternalTxType:
 		if protoTx.Gas == nil {
 			return errors.New("missing required field 'Gas' in ProtoTransaction")
 		}
@@ -359,7 +364,7 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 
 		tx.SetInner(&etx)
 
-	case 2:
+	case QiTxType:
 		if protoTx.TxIns == nil {
 			return errors.New("missing required field 'TxIns' in ProtoTransaction")
 		}
@@ -371,6 +376,9 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 		}
 		if protoTx.ChainId == nil {
 			return errors.New("missing required field 'ChainId' in ProtoTransaction")
+		}
+		if protoTx.Data == nil {
+			return errors.New("missing required field 'Data' in ProtoTransaction")
 		}
 		var qiTx QiTx
 		qiTx.ChainID = new(big.Int).SetBytes(protoTx.GetChainId())
@@ -410,6 +418,7 @@ func (tx *Transaction) ProtoDecode(protoTx *ProtoTransaction, location common.Lo
 			nonce := BlockNonce(uint64ToByteArr(*protoTx.WorkNonce))
 			qiTx.WorkNonce = &nonce
 		}
+		qiTx.Data = protoTx.GetData()
 		tx.SetInner(&qiTx)
 
 	default:
@@ -425,7 +434,7 @@ func (tx *Transaction) ProtoEncodeTxSigningData() *ProtoTransaction {
 		return protoTxSigningData
 	}
 	switch tx.Type() {
-	case 0:
+	case QuaiTxType:
 		txType := uint64(tx.Type())
 		protoTxSigningData.Type = &txType
 		protoTxSigningData.ChainId = tx.ChainId().Bytes()
@@ -443,16 +452,20 @@ func (tx *Transaction) ProtoEncodeTxSigningData() *ProtoTransaction {
 		if tx.To() != nil {
 			protoTxSigningData.To = tx.To().Bytes()
 		}
-		protoTxSigningData.MinerTip = tx.MinerTip().Bytes()
 		protoTxSigningData.GasPrice = tx.GasPrice().Bytes()
-	case 1:
+	case ExternalTxType:
 		return protoTxSigningData
-	case 2:
+	case QiTxType:
 		txType := uint64(tx.Type())
 		protoTxSigningData.Type = &txType
 		protoTxSigningData.ChainId = tx.ChainId().Bytes()
 		protoTxSigningData.TxIns, _ = tx.TxIn().ProtoEncode()
 		protoTxSigningData.TxOuts, _ = tx.TxOut().ProtoEncode()
+		if tx.Data() == nil {
+			protoTxSigningData.Data = []byte{}
+		} else {
+			protoTxSigningData.Data = tx.Data()
+		}
 	}
 	return protoTxSigningData
 }
@@ -583,9 +596,6 @@ func (tx *Transaction) Gas() uint64 { return tx.inner.gas() }
 // GasPrice returns the gas price of the transaction.
 func (tx *Transaction) GasPrice() *big.Int { return new(big.Int).Set(tx.inner.gasPrice()) }
 
-// MinerTip returns the minerTip per gas of the transaction.
-func (tx *Transaction) MinerTip() *big.Int { return new(big.Int).Set(tx.inner.minerTip()) }
-
 // EtxType returns the type of etx
 func (tx *Transaction) EtxType() uint64 { return tx.inner.etxType() }
 
@@ -662,6 +672,10 @@ func (tx *Transaction) IsLocal() bool {
 
 func (tx *Transaction) SetLocal(local bool) {
 	tx.local.Store(local)
+}
+
+func (tx *Transaction) Time() time.Time {
+	return tx.time
 }
 
 // Hash returns the transaction hash.
@@ -889,6 +903,7 @@ func TxDifferenceWithoutETXs(a, b Transactions) Transactions {
 
 	for _, tx := range a {
 		if _, ok := remove[tx.Hash()]; !ok && tx.Type() != ExternalTxType {
+			tx.time = time.Now() // Reset time in txpool reset
 			keep = append(keep, tx)
 		}
 	}
@@ -927,7 +942,7 @@ func NewTxWithMinerFee(tx *Transaction, qiTxFee *big.Int, received time.Time) (*
 			received: received,
 		}, nil
 	}
-	// minerFee is now the baseFee and minerTip
+	// minerFee is now the gas price mentioned in the transaction
 	minerFee := tx.GasPrice()
 	return &TxWithMinerFee{
 		tx:       tx,
@@ -977,7 +992,7 @@ type TransactionsByPriceAndNonce struct {
 //
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
-func NewTransactionsByPriceAndNonce(signer Signer, qiTxs []*TxWithMinerFee, txs map[common.AddressBytes]Transactions, sortTx bool) *TransactionsByPriceAndNonce {
+func NewTransactionsByPriceAndNonce(signer Signer, qiTxs []*TxWithMinerFee, txs map[common.AddressBytes]Transactions) *TransactionsByPriceAndNonce {
 	// Initialize a price and received time based heap with the head transactions
 	heads := make(TxByPriceAndTime, 0, len(txs))
 
@@ -1009,12 +1024,10 @@ func NewTransactionsByPriceAndNonce(signer Signer, qiTxs []*TxWithMinerFee, txs 
 		}
 	}
 
-	if sortTx {
-		// Sort Eligible Transactions by Gas Used in Descending Order
-		sort.Slice(heads, func(i, j int) bool {
-			return heads[i].MinerFee().Cmp(heads[j].MinerFee()) > 0
-		})
-	}
+	// Sort Eligible Transactions by Gas Used in Descending Order
+	sort.Slice(heads, func(i, j int) bool {
+		return heads[i].MinerFee().Cmp(heads[j].MinerFee()) > 0
+	})
 
 	// Assemble and return the transaction set
 	return &TransactionsByPriceAndNonce{
@@ -1047,24 +1060,15 @@ func (t *TransactionsByPriceAndNonce) GetFee() *big.Int {
 }
 
 // Shift replaces the current best head with the next one from the same account.
-func (t *TransactionsByPriceAndNonce) Shift(acc common.AddressBytes, sort bool) {
+func (t *TransactionsByPriceAndNonce) Shift(acc common.AddressBytes) {
 	if txs, ok := t.txs[acc]; ok && len(txs) > 0 {
 		if wrapped, err := NewTxWithMinerFee(txs[0], nil, time.Time{}); err == nil {
 			t.heads[0], t.txs[acc] = wrapped, txs[1:]
-			if sort {
-				heap.Fix(&t.heads, 0)
-			}
+			heap.Fix(&t.heads, 0)
 			return
 		}
 	}
-	if sort {
-		heap.Pop(&t.heads)
-	} else if len(t.heads) > 1 {
-		t.heads = t.heads[1:]
-	} else {
-		t.heads = make(TxByPriceAndTime, 0)
-	}
-
+	heap.Pop(&t.heads)
 }
 
 // Pop the first transaction without sorting
@@ -1074,25 +1078,6 @@ func (t *TransactionsByPriceAndNonce) PopNoSort() {
 	} else {
 		t.heads = make(TxByPriceAndTime, 0)
 	}
-}
-
-func (t *TransactionsByPriceAndNonce) Last(i int) *TransactionsByPriceAndNonce {
-	if t.Peek() != nil {
-		if len(t.heads) < i {
-			return nil
-		}
-		return &TransactionsByPriceAndNonce{
-			txs:    nil,
-			heads:  t.heads[len(t.heads)-i : len(t.heads)-i+1],
-			signer: t.signer,
-		}
-	} else {
-		return nil
-	}
-}
-
-func (t *TransactionsByPriceAndNonce) SetHead(txs TxByPriceAndTime) {
-	t.heads = txs
 }
 
 // Pop removes the best transaction, *not* replacing it with the next one from
@@ -1112,7 +1097,6 @@ type Message struct {
 	amount     *big.Int
 	gasLimit   uint64
 	gasPrice   *big.Int
-	minerTip   *big.Int
 	data       []byte
 	accessList AccessList
 	isETX      bool
@@ -1122,7 +1106,7 @@ type Message struct {
 	lock       *big.Int
 }
 
-func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice, minerTip *big.Int, data []byte, accessList AccessList, isETX bool) Message {
+func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte, accessList AccessList, isETX bool) Message {
 	return Message{
 		from:       from,
 		to:         to,
@@ -1130,7 +1114,6 @@ func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *b
 		amount:     amount,
 		gasLimit:   gasLimit,
 		gasPrice:   gasPrice,
-		minerTip:   minerTip,
 		data:       data,
 		accessList: accessList,
 		isETX:      isETX,
@@ -1143,7 +1126,6 @@ func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
 	msg := Message{
 		gasLimit:   tx.Gas(),
 		gasPrice:   new(big.Int).Set(tx.GasPrice()),
-		minerTip:   new(big.Int).Set(tx.MinerTip()),
 		to:         tx.To(),
 		amount:     tx.Value(),
 		data:       tx.Data(),
@@ -1169,7 +1151,6 @@ func (tx *Transaction) AsMessageWithSender(s Signer, baseFee *big.Int, sender *c
 	msg := Message{
 		gasLimit:   tx.Gas(),
 		gasPrice:   new(big.Int).Set(tx.GasPrice()),
-		minerTip:   new(big.Int).Set(tx.MinerTip()),
 		to:         tx.To(),
 		amount:     tx.Value(),
 		data:       tx.Data(),
@@ -1214,7 +1195,6 @@ func CompareFeeBetweenTx(a, b *Transaction) int {
 func (m Message) From() common.Address      { return m.from }
 func (m Message) To() *common.Address       { return m.to }
 func (m Message) GasPrice() *big.Int        { return m.gasPrice }
-func (m Message) MinerTip() *big.Int        { return m.minerTip }
 func (m Message) Value() *big.Int           { return m.amount }
 func (m Message) Gas() uint64               { return m.gasLimit }
 func (m Message) Nonce() uint64             { return m.nonce }
@@ -1308,4 +1288,18 @@ func IsConversionTx(tx *Transaction) bool {
 		return false
 	}
 	return tx.EtxType() == ConversionType
+}
+
+func IsQiToQuaiConversionTx(tx *Transaction) bool {
+	if tx.Type() == ExternalTxType && tx.EtxType() == ConversionType && tx.To().IsInQuaiLedgerScope() {
+		return true
+	}
+	return false
+}
+
+func IsQuaiToQiConversionTx(tx *Transaction) bool {
+	if tx.Type() == ExternalTxType && tx.EtxType() == ConversionType && tx.To().IsInQiLedgerScope() {
+		return true
+	}
+	return false
 }

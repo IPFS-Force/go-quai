@@ -8,16 +8,17 @@ import (
 	"path/filepath"
 	"runtime"
 	godebug "runtime/debug"
+	"strconv"
 	"sync"
 	"syscall"
 
+	"github.com/dominant-strategies/go-quai/metrics_config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
 	"github.com/dominant-strategies/go-quai/cmd/utils"
 	"github.com/dominant-strategies/go-quai/common"
 	"github.com/dominant-strategies/go-quai/log"
-	"github.com/dominant-strategies/go-quai/metrics_config"
 	"github.com/dominant-strategies/go-quai/p2p/node"
 	"github.com/dominant-strategies/go-quai/params"
 )
@@ -28,7 +29,7 @@ var startCmd = &cobra.Command{
 	Use:   "start",
 	Short: "starts a go-quai p2p node",
 	Long: `starts the go-quai daemon. The daemon will start a libp2p node and a http API.
-By default the node will bootstrap to the public bootstrap nodes and port 4001. 
+By default the node will bootstrap to the public bootstrap nodes and port 4002. 
 To bootstrap to a private node, use the --bootstrap flag.`,
 	RunE:                       runStart,
 	SilenceUsage:               true,
@@ -67,7 +68,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if viper.IsSet(utils.PprofFlag.Name) {
+	if viper.GetBool(utils.PprofFlag.Name) {
 		EnablePprof()
 	}
 
@@ -99,8 +100,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	if viper.IsSet(utils.MetricsEnabledFlag.Name) {
 		log.Global.Info("Starting metrics")
-		metrics_config.EnableMetrics()
-		go metrics_config.StartProcessMetrics()
+		var (
+			addr string
+			port int
+		)
+
+		addr = viper.GetString(utils.MetricsHTTPFlag.Name)
+		port = viper.GetInt(utils.MetricsPortFlag.Name)
+
+		if addr != "" && port != 0 {
+			endpoint := addr + ":" + strconv.Itoa(port)
+			metrics_config.EnableMetrics(endpoint)
+			go metrics_config.StartProcessMetrics()
+		}
 	}
 
 	// wait for a SIGINT or SIGTERM signal

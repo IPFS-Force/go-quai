@@ -97,6 +97,8 @@ type ChainHeaderReader interface {
 	WorkShareDistance(wo *types.WorkObject, ws *types.WorkObjectHeader) (*big.Int, error)
 	Database() ethdb.Database
 
+	ComputeMinerDifficulty(parent *types.WorkObject) *big.Int
+
 	BlockReader
 }
 
@@ -226,6 +228,8 @@ type BlockReader interface {
 	GetBlockByHash(hash common.Hash) *types.WorkObject
 	CheckInCalcOrderCache(common.Hash) (*big.Int, int, bool)
 	AddToCalcOrderCache(common.Hash, int, *big.Int)
+
+	CalcBaseFee(wo *types.WorkObject) *big.Int
 }
 
 func TargetToDifficulty(target *big.Int) *big.Int {

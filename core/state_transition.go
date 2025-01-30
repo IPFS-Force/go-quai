@@ -33,6 +33,17 @@ import (
 var emptyCodeHash = crypto.Keccak256Hash(nil)
 var suicide = []byte("Suicide")
 
+// conversion related variables
+var (
+	kQuaiSettingAddress = common.HexToAddress("0x00201De0D8854d63121c0cfF96Ae01cD3ef62414", common.Location{0, 0})
+	updateKQuai         = []byte("update")
+	updateKQuaiLen      = len(updateKQuai)
+	freezeKQuai         = []byte("freeze")
+	freezeKQuaiLen      = len(freezeKQuai)
+	unfreezeKQuai       = []byte("unfreeze")
+	unfreezeKQuaiLen    = len(unfreezeKQuai)
+)
+
 /*
 The State Transitioning Model
 
@@ -57,7 +68,6 @@ type StateTransition struct {
 	msg        Message
 	gas        uint64
 	gasPrice   *big.Int
-	minerTip   *big.Int
 	initialGas uint64
 	value      *big.Int
 	data       []byte
@@ -66,7 +76,7 @@ type StateTransition struct {
 }
 
 func (st *StateTransition) fee() *big.Int {
-	return new(big.Int).Add(st.gasPrice, st.minerTip)
+	return st.gasPrice
 }
 
 // Message represents a message sent to a contract.
@@ -75,7 +85,6 @@ type Message interface {
 	To() *common.Address
 
 	GasPrice() *big.Int
-	MinerTip() *big.Int
 	Gas() uint64
 	Value() *big.Int
 
@@ -172,7 +181,6 @@ func NewStateTransition(evm *vm.EVM, msg Message, gp *types.GasPool) *StateTrans
 		evm:      evm,
 		msg:      msg,
 		gasPrice: msg.GasPrice(),
-		minerTip: msg.MinerTip(),
 		value:    msg.Value(),
 		data:     msg.Data(),
 		state:    evm.StateDB,
@@ -203,7 +211,7 @@ func (st *StateTransition) buyGas() error {
 	mgval = mgval.Mul(mgval, st.gasPrice)
 	balanceCheck := mgval
 	balanceCheck = new(big.Int).SetUint64(st.msg.Gas())
-	balanceCheck = balanceCheck.Mul(balanceCheck, new(big.Int).Add(st.minerTip, st.gasPrice))
+	balanceCheck = balanceCheck.Mul(balanceCheck, st.gasPrice)
 	balanceCheck.Add(balanceCheck, st.value)
 	from, err := st.msg.From().InternalAndQuaiAddress()
 	if err != nil {
@@ -261,13 +269,9 @@ func (st *StateTransition) preCheck() error {
 	}
 	// Make sure that transaction gasPrice is greater than the baseFee
 	// Skip the checks if gas fields are zero and baseFee was explicitly disabled (eth_call)
-	if !st.evm.Config.NoBaseFee || st.gasPrice.BitLen() > 0 || st.minerTip.BitLen() > 0 {
+	if !st.evm.Config.NoBaseFee || st.gasPrice.BitLen() > 0 {
 		if l := st.gasPrice.BitLen(); l > 256 {
 			return fmt.Errorf("%w: address %v, gasPrice bit length: %d", ErrFeeCapVeryHigh,
-				st.msg.From().Hex(), l)
-		}
-		if l := st.minerTip.BitLen(); l > 256 {
-			return fmt.Errorf("%w: address %v, minerTip bit length: %d", ErrTipVeryHigh,
 				st.msg.From().Hex(), l)
 		}
 		// This will panic if baseFee is nil, but basefee presence is verified
@@ -358,6 +362,51 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	activePrecompiles := vm.ActivePrecompiles(rules, st.evm.ChainConfig().Location)
 	st.state.PrepareAccessList(msg.From(), msg.To(), activePrecompiles, msg.AccessList(), st.evm.Config.Debug)
 
+	// If the transaction is coming from kQuaiSettingAddress, it can encode information in the data and
+	// perform three things
+	// 1) Set the KQuai exchange rate so that the protocol can use it going forward
+	// from the next block
+	// 2) Freeze the KQuai exchange rate computation, once this is done, the
+	// KQuai controller stops computing until its unforzen
+	// 3) UnFreeze the KQuai exchange rate computation, once this is done, the
+	// KQuai controller, starts computing the KQuai value
+	// This address cannot do anything else
+	if msg.From().Equal(kQuaiSettingAddress) && st.evm.Context.BlockNumber.Uint64() < params.BlocksPerYear {
+		if !st.msg.IsETX() && !contractCreation && len(st.data) > updateKQuaiLen && bytes.Equal(st.data[:updateKQuaiLen], updateKQuai) {
+			kQuaiValue := new(big.Int).SetBytes(st.data[updateKQuaiLen:])
+			err := st.state.UpdateKQuai(kQuaiValue)
+			if err != nil {
+				return nil, fmt.Errorf("unable to update k quai: %v", err)
+			}
+		} else if !st.msg.IsETX() && !contractCreation && len(st.data) == freezeKQuaiLen && bytes.Equal(st.data[:freezeKQuaiLen], freezeKQuai) {
+			err := st.state.FreezeKQuai()
+			if err != nil {
+				return nil, fmt.Errorf("unable to freeze k quai: %v", err)
+			}
+		} else if !st.msg.IsETX() && !contractCreation && len(st.data) == unfreezeKQuaiLen && bytes.Equal(st.data[:unfreezeKQuaiLen], unfreezeKQuai) {
+			err := st.state.UnFreezeKQuai()
+			if err != nil {
+				return nil, fmt.Errorf("unable to un freeze k quai: %v", err)
+			}
+		} else {
+			return nil, fmt.Errorf("invalid data used: %v", st.data)
+		}
+
+		effectiveTip := st.fee()
+		return &ExecutionResult{
+			UsedGas:      st.gasUsed(),
+			UsedState:    0,
+			Err:          nil,
+			ReturnData:   []byte{},
+			Etxs:         nil,
+			QuaiFees:     new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), effectiveTip),
+			ContractAddr: nil,
+		}, nil
+
+	} else if msg.From().Equal(kQuaiSettingAddress) {
+		return nil, fmt.Errorf("transaction is not allowed from the kQuaiSettingAddress after the first year")
+	}
+
 	if !st.msg.IsETX() && !contractCreation && len(st.data) == 27 && bytes.Equal(st.data[:7], suicide) && st.to().Equal(st.msg.From()) {
 		// Caller requests self-destruct
 		beneficiary, err := common.BytesToAddress(st.data[7:27], st.evm.ChainConfig().Location).InternalAndQuaiAddress()
@@ -370,7 +419,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		}
 		balance := st.evm.StateDB.GetBalance(fromInternal)
 		st.evm.StateDB.Suicide(fromInternal)
-		refund := new(big.Int).Mul(st.evm.Context.AverageBaseFee, new(big.Int).SetUint64(params.CallNewAccountGas(st.evm.Context.QuaiStateSize)))
+		refund := new(big.Int).Mul(st.evm.Context.BaseFee, new(big.Int).SetUint64(params.CallNewAccountGas(st.evm.Context.QuaiStateSize)))
 		balance.Add(balance, refund)
 		st.evm.StateDB.AddBalance(beneficiary, balance)
 
