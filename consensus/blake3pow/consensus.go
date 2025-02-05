@@ -617,44 +617,35 @@ func (blake3pow *Blake3pow) Prepare(chain consensus.ChainHeaderReader, header *t
 // Finalize implements consensus.Engine, accumulating the block and uncle rewards,
 // setting the final state on the header
 // Finalize returns the new MuHash of the UTXO set, the new size of the UTXO set and an error if any
-func (blake3pow *Blake3pow) Finalize(chain consensus.ChainHeaderReader, batch ethdb.Batch, header *types.WorkObject, state *state.StateDB, setRoots bool, utxoSetSize uint64, utxosCreate, utxosDelete []common.Hash) (*multiset.MultiSet, uint64, error) {
+func (blake3pow *Blake3pow) Finalize(chain consensus.ChainHeaderReader, batch ethdb.Batch, header *types.WorkObject, state *state.StateDB, setRoots bool, utxoSetSize uint64, utxosCreate, utxosDelete []common.Hash, supplyRemovedQi *big.Int) (*multiset.MultiSet, uint64, error) {
 	nodeLocation := blake3pow.config.NodeLocation
 	nodeCtx := blake3pow.config.NodeLocation.Context()
+
+	if nodeLocation.Equal(common.Location{0, 0}) {
+		err := state.AddLockedBalances(header.Number(common.ZONE_CTX), blake3pow.config.GenAllocs, blake3pow.logger)
+		if err != nil {
+			log.Global.WithFields(log.Fields{
+				"err":      err,
+				"blockNum": header.Number(common.ZONE_CTX),
+			}).Error("Unable to add state for genesis accounts")
+			return nil, 0, err
+		}
+	}
+
 	var multiSet *multiset.MultiSet
 	if chain.IsGenesisHash(header.ParentHash(nodeCtx)) {
 		multiSet = multiset.New()
-		alloc := core.ReadGenesisAlloc("genallocs/gen_alloc_quai_"+nodeLocation.Name()+".json", blake3pow.logger)
-		blake3pow.logger.WithField("alloc", len(alloc)).Info("Allocating genesis accounts")
 		internalLockupContract, err := vm.LockupContractAddresses[[2]byte{nodeLocation[0], nodeLocation[1]}].InternalAddress()
 		if err != nil {
 			return nil, 0, fmt.Errorf("Error getting internal address for lockup contract, err %s", err)
 		}
 		state.SetNonce(internalLockupContract, 1)
-		for addressString, account := range alloc {
-			addr := common.HexToAddress(addressString, nodeLocation)
-			internal, err := addr.InternalAddress()
-			if err != nil {
-				blake3pow.logger.Errorf("Provided address in genesis block is out of scope, err %s", err)
-				continue
-			}
-			if addr.IsInQuaiLedgerScope() {
-				state.AddBalance(internal, account.Balance)
-				state.SetCode(internal, account.Code)
-				state.SetNonce(internal, account.Nonce)
-				for key, value := range account.Storage {
-					state.SetState(internal, key, value)
-				}
-			} else {
-				blake3pow.logger.WithField("address", addr.String()).Error("Provided address in genesis block alloc is not in the Quai ledger scope")
-				continue
-			}
-		}
+
 		addressOutpointMap := make(map[[20]byte][]*types.OutpointAndDenomination)
-		core.AddGenesisUtxos(chain.Database(), &utxosCreate, nodeLocation, addressOutpointMap, blake3pow.logger)
 		if chain.Config().IndexAddressUtxos {
 			chain.WriteAddressOutpoints(addressOutpointMap)
-			blake3pow.logger.Info("Indexed genesis utxos")
 		}
+
 	} else {
 		multiSet = rawdb.ReadMultiSet(chain.Database(), header.ParentHash(nodeCtx))
 	}
@@ -686,7 +677,7 @@ func (blake3pow *Blake3pow) Finalize(chain consensus.ChainHeaderReader, batch et
 					}
 				}()
 				nextBlockToTrim := rawdb.ReadCanonicalHash(chain.Database(), header.NumberU64(nodeCtx)-depth)
-				TrimBlock(chain, batch, denomination, header.NumberU64(nodeCtx)-depth, nextBlockToTrim, &utxosDelete, &trimmedUtxos, &utxoSetSize, !setRoots, &lock, blake3pow.logger) // setRoots is false when we are processing the block
+				TrimBlock(chain, batch, denomination, header.NumberU64(nodeCtx)-depth, nextBlockToTrim, &utxosDelete, &trimmedUtxos, supplyRemovedQi, &utxoSetSize, !setRoots, &lock, blake3pow.logger) // setRoots is false when we are processing the block
 				wg.Done()
 			}(denomination, depth)
 		}
@@ -717,7 +708,7 @@ func (blake3pow *Blake3pow) Finalize(chain consensus.ChainHeaderReader, batch et
 
 // TrimBlock trims all UTXOs of a given denomination that were created in a given block.
 // In the event of an attacker intentionally creating too many 9-byte keys that collide, we return the colliding keys to be trimmed in the next block.
-func TrimBlock(chain consensus.ChainHeaderReader, batch ethdb.Batch, denomination uint8, blockHeight uint64, blockHash common.Hash, utxosDelete *[]common.Hash, trimmedUtxos *[]*types.SpentUtxoEntry, utxoSetSize *uint64, deleteFromDb bool, lock *sync.Mutex, logger *log.Logger) {
+func TrimBlock(chain consensus.ChainHeaderReader, batch ethdb.Batch, denomination uint8, blockHeight uint64, blockHash common.Hash, utxosDelete *[]common.Hash, trimmedUtxos *[]*types.SpentUtxoEntry, supplyRemovedQi *big.Int, utxoSetSize *uint64, deleteFromDb bool, lock *sync.Mutex, logger *log.Logger) {
 	utxosCreated, _ := rawdb.ReadCreatedUTXOKeys(chain.Database(), blockHash)
 	if len(utxosCreated) == 0 {
 		logger.Infof("UTXOs created in block %d: %d", blockHeight, len(utxosCreated))
@@ -775,6 +766,9 @@ func TrimBlock(chain consensus.ChainHeaderReader, batch ethdb.Batch, denominatio
 		if deleteFromDb {
 			batch.Delete(key)
 			*trimmedUtxos = append(*trimmedUtxos, &types.SpentUtxoEntry{OutPoint: types.OutPoint{txHash, index}, UtxoEntry: utxo})
+			if supplyRemovedQi != nil {
+				supplyRemovedQi.Add(supplyRemovedQi, types.Denominations[denomination])
+			}
 		}
 		*utxoSetSize--
 		lock.Unlock()
@@ -787,7 +781,7 @@ func (blake3pow *Blake3pow) FinalizeAndAssemble(chain consensus.ChainHeaderReade
 	nodeCtx := blake3pow.config.NodeLocation.Context()
 	if nodeCtx == common.ZONE_CTX && chain.ProcessingState() {
 		// Finalize block
-		if _, _, err := blake3pow.Finalize(chain, nil, header, state, true, parentUtxoSetSize, utxosCreate, utxosDelete); err != nil {
+		if _, _, err := blake3pow.Finalize(chain, nil, header, state, true, parentUtxoSetSize, utxosCreate, utxosDelete, nil); err != nil {
 			return nil, err
 		}
 	}
