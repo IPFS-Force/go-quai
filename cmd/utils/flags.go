@@ -25,6 +25,7 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 
+	"github.com/dominant-strategies/go-quai/cmd/genallocs"
 	"github.com/dominant-strategies/go-quai/common"
 	"github.com/dominant-strategies/go-quai/common/constants"
 	"github.com/dominant-strategies/go-quai/common/fdlimit"
@@ -1526,6 +1527,14 @@ func SetQuaiConfig(stack *node.Node, cfg *quaiconfig.Config, slicesRunning []com
 		}
 	}
 
+	cfg.Genesis.AllocHash = params.AllocHash
+	if nodeLocation.Equal(common.Location{0, 0}) {
+		cfg.GenesisAllocs, err = genallocs.VerifyGenesisAllocs("cmd/genallocs/genesis_alloc.json", cfg.Genesis.AllocHash)
+		if err != nil {
+			log.Global.WithField("err", err).Fatal("Unable to allocate genesis accounts")
+		}
+	}
+
 	cfg.Genesis.Config.Location = nodeLocation
 }
 
@@ -1565,7 +1574,8 @@ func MakeChainDatabase(stack *node.Node, readonly bool) ethdb.Database {
 
 func GetGenesisNonce() (uint64, []byte) {
 	nonceBytes := common.FromHex(viper.GetString(GenesisNonce.Name))
-	if len(nonceBytes) == 0 {
+	if len(nonceBytes) < 8 {
+		log.Global.Error("Genesis nonce is too short, using default")
 		nonceBytes = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	}
 	nonce := binary.BigEndian.Uint64(nonceBytes[:8])

@@ -207,14 +207,12 @@ func NewStateProcessor(config *params.ChainConfig, hc *HeaderChain, engine conse
 }
 
 type UtxosCreatedDeleted struct {
-	UtxosCreatedKeys             [][]byte
-	UtxosCreatedHashes           []common.Hash
-	UtxosDeleted                 []*types.SpentUtxoEntry
-	UtxosDeletedHashes           []common.Hash
-	CoinbaseLockupsCreatedHashes map[string]common.Hash
-	CoinbaseLockupsDeletedHashes map[string]common.Hash
-	CoinbaseLockupsDeleted       map[[47]byte][]byte
-	RotatedEpochs                map[string]struct{}
+	UtxosCreatedKeys           [][]byte
+	UtxosCreatedHashes         []common.Hash
+	UtxosDeleted               []*types.SpentUtxoEntry
+	UtxosDeletedHashes         []common.Hash
+	CoinbaseLockupsCreatedKeys [][]byte
+	CoinbaseLockupsDeleted     []rawdb.DeletedCoinbaseLockup
 }
 
 // Process processes the state changes according to the Quai rules by running
@@ -267,11 +265,8 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 	if err != nil {
 		return types.Receipts{}, []*types.Transaction{}, []*types.Log{}, nil, 0, 0, 0, nil, nil, err
 	}
+	supplyAddedQi, supplyRemovedQi := big.NewInt(0), big.NewInt(0)
 	utxosCreatedDeleted := new(UtxosCreatedDeleted) // utxos created and deleted in this block
-	utxosCreatedDeleted.CoinbaseLockupsCreatedHashes = make(map[string]common.Hash)
-	utxosCreatedDeleted.CoinbaseLockupsDeletedHashes = make(map[string]common.Hash)
-	utxosCreatedDeleted.CoinbaseLockupsDeleted = make(map[[47]byte][]byte)
-	utxosCreatedDeleted.RotatedEpochs = make(map[string]struct{})
 	// Apply the previous inbound ETXs to the ETX set state
 	prevInboundEtxs := rawdb.ReadInboundEtxs(p.hc.bc.db, header.ParentHash(nodeCtx))
 	if len(prevInboundEtxs) > 0 {
@@ -366,7 +361,7 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 			if _, ok := senders[tx.Hash()]; ok {
 				checkSig = false
 			}
-			qiTxFee, etxs, receipt, err, timing := ProcessQiTx(tx, p.hc, checkSig, firstQiTx, header, batch, p.hc.headerDb, gp, usedGas, p.hc.pool.signer, p.hc.NodeLocation(), *p.config.ChainID, qiScalingFactor, &etxRLimit, &etxPLimit, utxosCreatedDeleted)
+			qiTxFee, etxs, receipt, err, timing := ProcessQiTx(tx, p.hc, checkSig, firstQiTx, header, batch, p.hc.headerDb, gp, usedGas, p.hc.pool.signer, p.hc.NodeLocation(), *p.config.ChainID, qiScalingFactor, &etxRLimit, &etxPLimit, utxosCreatedDeleted, supplyAddedQi, supplyRemovedQi)
 			if err != nil {
 				return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 			}
@@ -478,6 +473,8 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 							if err := rawdb.CreateUTXO(batch, etx.Hash(), outputIndex, utxo); err != nil {
 								return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 							}
+							supplyAddedQi.Add(supplyAddedQi, types.Denominations[uint8(denomination)])
+
 							utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, types.UTXOHash(etx.Hash(), outputIndex, utxo))
 							utxosCreatedDeleted.UtxosCreatedKeys = append(utxosCreatedDeleted.UtxosCreatedKeys, rawdb.UtxoKeyWithDenomination(etx.Hash(), outputIndex, utxo.Denomination))
 							p.logger.Debugf("Emitting Qi for coinbase lockup tx %032x with denomination %d index %d lock %d\n", tx.Hash(), denomination, outputIndex, 0)
@@ -544,6 +541,7 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 				}
 				if tx.To().IsInQiLedgerScope() { // Qi coinbase
 					if block.PrimeTerminusNumber().Uint64() < params.ControllerKickInBlock { // parent must be controller kick in block
+						p.logger.Errorf("Qi coinbase tx %x is not allowed before controller kick in block %d", tx.Hash(), params.ControllerKickInBlock)
 						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 						receipts = append(receipts, receipt)
 						allLogs = append(allLogs, receipt.Logs...)
@@ -560,7 +558,9 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 					}
 					lockup.Add(lockup, blockNumber)
 					value := params.CalculateCoinbaseValueWithLockup(tx.Value(), lockupByte, block.NumberU64(common.ZONE_CTX))
-					if len(tx.Data()) == 1 {
+					if len(tx.Data()) == 1+common.HashLength {
+						// Coinbase has no extra data or hash workshare hash as extra data
+						// Coinbase is valid
 						denominations := misc.FindMinDenominations(value)
 						outputIndex := uint16(0)
 						// Iterate over the denominations in descending order
@@ -579,6 +579,8 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 								if err := rawdb.CreateUTXO(batch, etx.Hash(), outputIndex, utxo); err != nil {
 									return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 								}
+								supplyAddedQi.Add(supplyAddedQi, types.Denominations[uint8(denomination)])
+
 								utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, types.UTXOHash(etx.Hash(), outputIndex, utxo))
 								utxosCreatedDeleted.UtxosCreatedKeys = append(utxosCreatedDeleted.UtxosCreatedKeys, rawdb.UtxoKeyWithDenomination(etx.Hash(), outputIndex, utxo.Denomination))
 								p.logger.Debugf("Creating UTXO for coinbase %032x with denomination %d index %d\n", tx.Hash(), denomination, outputIndex)
@@ -587,49 +589,43 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 							}
 						}
 						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusLocked, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
-					} else if len(tx.Data()) == common.AddressLength+1 || len(tx.Data()) == common.AddressLength+common.AddressLength+1 {
+					} else if len(tx.Data()) == 1+common.AddressLength+common.HashLength || len(tx.Data()) == 1+common.AddressLength+common.AddressLength+common.HashLength { // 1 byte for lockup, 20 bytes for recipient, 20 bytes for delegate (optional), 32 bytes for workshare hash
 						contractAddr := common.BytesToAddress(tx.Data()[1:common.AddressLength+1], nodeLocation)
 						internal, err := contractAddr.InternalAndQuaiAddress()
 						if err != nil {
 							return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("coinbase tx %x has invalid contract: %w", tx.Hash(), err)
 						}
-						if statedb.GetCode(internal) == nil || true {
+						if statedb.GetCode(internal) == nil || block.NumberU64(common.ZONE_CTX) < params.CoinbaseLockupPrecompileKickInHeight {
 							// No code at contract address
 							// Coinbase reward is lost
 							// Justification: We should not store a coinbase lockup that can never be claimed
+							p.logger.Errorf("Coinbase tx %x has no code at contract address %x", tx.Hash(), contractAddr)
 							receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 						} else {
 							var delegate common.Address
-							if len(tx.Data()) == common.AddressLength+common.AddressLength+1 {
-								delegate = common.BytesToAddress(tx.Data()[common.AddressLength+1:], nodeLocation)
+							if len(tx.Data()) == common.AddressLength+common.AddressLength+common.HashLength+1 {
+								delegate = common.BytesToAddress(tx.Data()[common.AddressLength+1:common.AddressLength+common.AddressLength+1], nodeLocation)
 							} else {
 								delegate = common.Zero
 							}
-							oldCoinbaseLockupKey, newCoinbaseLockupKey, oldCoinbaseLockupHash, newCoinbaseLockupHash, err := vm.AddNewLock(statedb, batch, contractAddr, *etx.To(), delegate, common.OneInternal(nodeLocation), lockupByte, lockup.Uint64(), coinbaseLockupEpoch, value, nodeLocation, true)
-							if err != nil || newCoinbaseLockupHash == nil {
+							delete, oldLockupData, coinbaseLockupKey, oldCoinbaseLockupHash, newCoinbaseLockupHash, err := vm.AddNewLock(statedb, batch, contractAddr, *etx.To(), delegate, common.OneInternal(nodeLocation), lockupByte, lockup.Uint64(), coinbaseLockupEpoch, value, nodeLocation, p.logger, block.ParentHash(common.ZONE_CTX), true)
+							if err != nil || newCoinbaseLockupHash == (common.Hash{}) {
 								return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("could not add new lock: %w", err)
 							}
 							// Store the new lockup key every time
-							utxosCreatedDeleted.CoinbaseLockupsCreatedHashes[string(newCoinbaseLockupKey)] = *newCoinbaseLockupHash
+							utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, newCoinbaseLockupHash)
+							utxosCreatedDeleted.CoinbaseLockupsCreatedKeys = append(utxosCreatedDeleted.CoinbaseLockupsCreatedKeys, coinbaseLockupKey)
 
-							if oldCoinbaseLockupHash != nil {
-								// We deleted (updated) the old lockup, write it to deleted list but only the first time
-								if _, exists := utxosCreatedDeleted.CoinbaseLockupsDeletedHashes[string(oldCoinbaseLockupKey)]; !exists {
-									if _, exists := utxosCreatedDeleted.RotatedEpochs[string(newCoinbaseLockupKey)]; !exists {
-										// We only want to add a delete if we have not rotated the epoch (we haven't created a new lock) because otherwise there is nothing to delete
-										utxosCreatedDeleted.CoinbaseLockupsDeletedHashes[string(oldCoinbaseLockupKey)] = *oldCoinbaseLockupHash
-										utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, *oldCoinbaseLockupHash)
-									}
-								}
-							} else {
-								// If we did not delete, we are rotating the epoch and need to store it
-								utxosCreatedDeleted.RotatedEpochs[string(newCoinbaseLockupKey)] = struct{}{}
+							if delete {
+								utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, oldCoinbaseLockupHash)
+								utxosCreatedDeleted.CoinbaseLockupsDeleted = append(utxosCreatedDeleted.CoinbaseLockupsDeleted, rawdb.DeletedCoinbaseLockup{Key: coinbaseLockupKey, Value: oldLockupData})
 							}
 							receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusLocked, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()} // todo: consider adding the reward to the receipt in a log
 						}
 					} else {
 						// Coinbase data is either too long or too small
 						// Coinbase reward is lost
+						p.logger.Errorf("Coinbase tx %x has invalid data length %d", tx.Hash(), len(tx.Data()))
 						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 					}
 					receipts = append(receipts, receipt)
@@ -639,14 +635,10 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 					if err != nil {
 						return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("coinbase tx %x has invalid recipient: %w", tx.Hash(), err)
 					}
-					if len(tx.Data()) == 1 {
+					if len(tx.Data()) == 1+common.HashLength {
 						// Coinbase is valid, no gas used
 						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusLocked, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
-					} else if len(tx.Data()) != common.AddressLength+1 && len(tx.Data()) != common.AddressLength+common.AddressLength+1 {
-						// Coinbase data is either too long or too small
-						// Coinbase reward is lost
-						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
-					} else { // Quai coinbase lockup contract
+					} else if len(tx.Data()) == 1+common.AddressLength+common.HashLength || len(tx.Data()) == 1+common.AddressLength+common.AddressLength+common.HashLength { // Quai coinbase lockup contract
 						// Create params for uint256 lockup, uint256 balance, address recipient
 						lockup := new(big.Int).SetUint64(params.LockupByteToBlockDepth[lockupByte])
 						if lockup.Uint64() < params.ConversionLockPeriod {
@@ -659,44 +651,45 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 						if err != nil {
 							return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("coinbase tx %x has invalid recipient: %w", tx.Hash(), err)
 						}
-						if statedb.GetCode(internal) == nil || true {
+						if statedb.GetCode(internal) == nil || block.NumberU64(common.ZONE_CTX) < params.CoinbaseLockupPrecompileKickInHeight {
 							// No code at contract address
 							// Coinbase reward is lost
 							// Justification: We should not store a coinbase lockup that can never be claimed
+							p.logger.Errorf("Coinbase tx %x has no code at contract address %x", tx.Hash(), contractAddr)
 							receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 						} else {
 							var delegate common.Address
-							if len(tx.Data()) == common.AddressLength+common.AddressLength+1 {
-								delegate = common.BytesToAddress(tx.Data()[common.AddressLength+1:], nodeLocation)
+							if len(tx.Data()) == common.AddressLength+common.AddressLength+common.HashLength+1 {
+								delegate = common.BytesToAddress(tx.Data()[common.AddressLength+1:common.AddressLength+common.AddressLength+1], nodeLocation)
 							} else {
 								delegate = common.Zero
 							}
 							reward := params.CalculateCoinbaseValueWithLockup(tx.Value(), lockupByte, block.NumberU64(common.ZONE_CTX))
 							// Add the lockup owned by the smart contract with the miner as beneficiary
-							oldCoinbaseLockupKey, newCoinbaseLockupKey, oldCoinbaseLockupHash, newCoinbaseLockupHash, err := vm.AddNewLock(statedb, batch, contractAddr, *etx.To(), delegate, common.OneInternal(nodeLocation), lockupByte, lockup.Uint64(), coinbaseLockupEpoch, reward, nodeLocation, true)
-							if err != nil || newCoinbaseLockupHash == nil {
+							delete, oldLockupData, coinbaseLockupKey, oldCoinbaseLockupHash, newCoinbaseLockupHash, err := vm.AddNewLock(statedb, batch, contractAddr, *etx.To(), delegate, common.OneInternal(nodeLocation), lockupByte, lockup.Uint64(), coinbaseLockupEpoch, reward, nodeLocation, p.logger, block.ParentHash(common.ZONE_CTX), true)
+							if err != nil || newCoinbaseLockupHash == (common.Hash{}) {
 								return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("could not add new lock: %w", err)
 							}
 							// Store the new lockup key every time
-							utxosCreatedDeleted.CoinbaseLockupsCreatedHashes[string(newCoinbaseLockupKey)] = *newCoinbaseLockupHash
+							utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, newCoinbaseLockupHash)
 
-							if oldCoinbaseLockupHash != nil {
-								// We deleted (updated) the old lockup, write it to deleted list but only the first time
-								if _, exists := utxosCreatedDeleted.CoinbaseLockupsDeletedHashes[string(oldCoinbaseLockupKey)]; !exists {
-									if _, exists := utxosCreatedDeleted.RotatedEpochs[string(newCoinbaseLockupKey)]; !exists { // Don't register deletes for any rotated epochs
-										utxosCreatedDeleted.CoinbaseLockupsDeletedHashes[string(oldCoinbaseLockupKey)] = *oldCoinbaseLockupHash
-										utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, *oldCoinbaseLockupHash)
-									}
-								}
+							if delete {
+								utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, oldCoinbaseLockupHash)
+								utxosCreatedDeleted.CoinbaseLockupsDeleted = append(utxosCreatedDeleted.CoinbaseLockupsDeleted, rawdb.DeletedCoinbaseLockup{Key: coinbaseLockupKey, Value: oldLockupData})
 							} else {
-								// If we did not delete, we are rotating the epoch and need to store it
-								utxosCreatedDeleted.RotatedEpochs[string(newCoinbaseLockupKey)] = struct{}{}
+								// We didn't delete a previous state, therefore we are creating a new state and must store it
+								utxosCreatedDeleted.CoinbaseLockupsCreatedKeys = append(utxosCreatedDeleted.CoinbaseLockupsCreatedKeys, coinbaseLockupKey)
 							}
 							receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusLocked, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 							if block.NumberU64(common.ZONE_CTX) > params.TimeToStartTx {
 								receipt.GasUsed = params.TxGas
 							}
 						}
+					} else {
+						// Coinbase data is either too long or too small
+						// Coinbase reward is lost
+						p.logger.Errorf("Coinbase tx %x has invalid data length %d", tx.Hash(), len(tx.Data()))
+						receipt = &types.Receipt{Type: tx.Type(), Status: types.ReceiptStatusFailed, GasUsed: gasUsedForCoinbase, TxHash: tx.Hash()}
 					}
 					receipts = append(receipts, receipt)
 					allLogs = append(allLogs, receipt.Logs...)
@@ -768,6 +761,8 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 							if err := rawdb.CreateUTXO(batch, etx.Hash(), outputIndex, utxo); err != nil {
 								return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 							}
+							supplyAddedQi.Add(supplyAddedQi, types.Denominations[uint8(denomination)])
+
 							utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, types.UTXOHash(etx.Hash(), outputIndex, utxo))
 							utxosCreatedDeleted.UtxosCreatedKeys = append(utxosCreatedDeleted.UtxosCreatedKeys, rawdb.UtxoKeyWithDenomination(etx.Hash(), outputIndex, utxo.Denomination))
 							p.logger.Debugf("Converting Quai to Qi %032x with denomination %d index %d lock %d\n", tx.Hash(), denomination, outputIndex, lock)
@@ -794,6 +789,8 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 					if err := rawdb.CreateUTXO(batch, etx.OriginatingTxHash(), etx.ETXIndex(), utxo); err != nil {
 						return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 					}
+					supplyAddedQi.Add(supplyAddedQi, types.Denominations[utxo.Denomination])
+
 					utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, types.UTXOHash(etx.OriginatingTxHash(), etx.ETXIndex(), utxo))
 					utxosCreatedDeleted.UtxosCreatedKeys = append(utxosCreatedDeleted.UtxosCreatedKeys, rawdb.UtxoKeyWithDenomination(etx.OriginatingTxHash(), etx.ETXIndex(), utxo.Denomination))
 					// This Qi ETX should cost more gas
@@ -843,7 +840,7 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 						utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, *hash)
 					}
 					for key, lockup := range receipt.CoinbaseLockupsDeleted {
-						utxosCreatedDeleted.CoinbaseLockupsDeleted[key] = lockup
+						utxosCreatedDeleted.CoinbaseLockupsDeleted = append(utxosCreatedDeleted.CoinbaseLockupsDeleted, rawdb.DeletedCoinbaseLockup{Key: key[:], Value: lockup})
 					}
 				}
 				receipts = append(receipts, receipt)
@@ -887,7 +884,7 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 					utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, *hash)
 				}
 				for key, lockup := range receipt.CoinbaseLockupsDeleted {
-					utxosCreatedDeleted.CoinbaseLockupsDeleted[key] = lockup
+					utxosCreatedDeleted.CoinbaseLockupsDeleted = append(utxosCreatedDeleted.CoinbaseLockupsDeleted, rawdb.DeletedCoinbaseLockup{Key: key[:], Value: lockup})
 				}
 			}
 			receipts = append(receipts, receipt)
@@ -948,7 +945,20 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 
 		targetBlockNumber := block.NumberU64(common.ZONE_CTX) - uint64(params.WorkSharesInclusionDepth)
 
-		targetBlock := p.hc.GetBlockByNumber(targetBlockNumber)
+		targetBlocks := make([]*types.WorkObject, 0, params.WorkSharesInclusionDepth)
+		blockCopy := block
+		for i := 0; i < params.WorkSharesInclusionDepth; i++ {
+			targetBlock := p.hc.GetBlockByHash(blockCopy.ParentHash(nodeCtx))
+			if targetBlock == nil {
+				return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("cannot find target block %s", block.ParentHash(nodeCtx).Hex())
+			}
+			targetBlocks = append(targetBlocks, targetBlock)
+			blockCopy = targetBlock
+		}
+		targetBlock := targetBlocks[params.WorkSharesInclusionDepth-1]
+		if targetBlock.NumberU64(common.ZONE_CTX) != targetBlockNumber {
+			return nil, nil, nil, nil, 0, 0, 0, nil, nil, fmt.Errorf("target block number %d does not match the target block number %d", targetBlock.NumberU64(common.ZONE_CTX), targetBlockNumber)
+		}
 
 		totalEntropy := big.NewInt(0)
 		powHash, err := p.engine.ComputePowHash(targetBlock.WorkObjectHeader())
@@ -967,13 +977,12 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 		entropyOfSharesAtTargetBlockDepth = append(entropyOfSharesAtTargetBlockDepth, zoneThresholdEntropy)
 
 		for i := 0; i <= params.WorkSharesInclusionDepth; i++ {
-			blockAtHeight := p.hc.GetBlockByNumber(targetBlockNumber + uint64(i))
 
 			var uncles []*types.WorkObjectHeader
 			if i == params.WorkSharesInclusionDepth {
 				uncles = block.Uncles()
 			} else {
-				uncles = blockAtHeight.Uncles()
+				uncles = targetBlocks[i].Uncles()
 			}
 
 			for _, uncle := range uncles {
@@ -1032,21 +1041,16 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 				// convert the quai reward value into Qi
 				shareReward = new(big.Int).Set(misc.QuaiToQi(targetBlock, exchangeRate, targetBlock.Difficulty(), shareReward))
 			}
-			if shareReward.Sign() == 0 {
+			if shareReward.Cmp(common.Big0) == 0 {
 				shareReward = big.NewInt(1)
 			}
-			emittedEtxs = append(emittedEtxs, types.NewTx(&types.ExternalTx{To: &uncleCoinbase, Gas: params.TxGas, Value: shareReward, EtxType: types.CoinbaseType, OriginatingTxHash: originHash, ETXIndex: uint16(len(emittedEtxs)), Sender: uncleCoinbase, Data: share.Data()}))
+			emittedEtxs = append(emittedEtxs, types.NewTx(&types.ExternalTx{To: &uncleCoinbase, Gas: params.TxGas, Value: shareReward, EtxType: types.CoinbaseType, OriginatingTxHash: originHash, ETXIndex: uint16(len(emittedEtxs)), Sender: uncleCoinbase, Data: append(share.Data(), share.Hash().Bytes()...)}))
 		}
-	}
-
-	for _, hash := range utxosCreatedDeleted.CoinbaseLockupsCreatedHashes {
-		// Update the created hash list with the latest new elements (instead of intermediate ones)
-		utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, hash)
 	}
 
 	time4 := common.PrettyDuration(time.Since(start))
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
-	multiSet, utxoSetSize, err := p.engine.Finalize(p.hc, batch, block, statedb, false, parentUtxoSetSize, utxosCreatedDeleted.UtxosCreatedHashes, utxosCreatedDeleted.UtxosDeletedHashes)
+	multiSet, utxoSetSize, err := p.engine.Finalize(p.hc, batch, block, statedb, false, parentUtxoSetSize, utxosCreatedDeleted.UtxosCreatedHashes, utxosCreatedDeleted.UtxosDeletedHashes, supplyRemovedQi)
 	if err != nil {
 		return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 	}
@@ -1096,15 +1100,14 @@ func (p *StateProcessor) Process(block *types.WorkObject, batch ethdb.Batch) (ty
 	if err := rawdb.WriteCreatedUTXOKeys(batch, blockHash, utxosCreatedDeleted.UtxosCreatedKeys); err != nil { // Could do this in Apply instead
 		return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 	}
-	coinbaseLockupsCreatedKeys := make([][]byte, 0, len(utxosCreatedDeleted.CoinbaseLockupsCreatedHashes))
-	for key, _ := range utxosCreatedDeleted.CoinbaseLockupsCreatedHashes {
-		coinbaseLockupsCreatedKeys = append(coinbaseLockupsCreatedKeys, []byte(key))
-	}
-	if err := rawdb.WriteCreatedCoinbaseLockupKeys(batch, blockHash, coinbaseLockupsCreatedKeys); err != nil {
+	if err := rawdb.WriteCreatedCoinbaseLockupKeys(batch, blockHash, utxosCreatedDeleted.CoinbaseLockupsCreatedKeys); err != nil {
 		return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
 	}
 	if err := rawdb.WriteDeletedCoinbaseLockups(batch, blockHash, utxosCreatedDeleted.CoinbaseLockupsDeleted); err != nil {
 		return nil, nil, nil, nil, 0, 0, 0, nil, nil, err
+	}
+	if err := rawdb.WriteSupplyAnalyticsForBlock(batch, p.hc.headerDb, blockHash, block.ParentHash(nodeCtx), statedb.SupplyAdded, statedb.SupplyRemoved, supplyAddedQi, supplyRemovedQi); err != nil {
+		p.logger.Errorf("failed to write supply analytics for block %x: %v", blockHash, err)
 	}
 	return receipts, emittedEtxs, allLogs, statedb, *usedGas, *usedState, utxoSetSize, multiSet, unlocks, nil
 }
@@ -1550,7 +1553,7 @@ func ValidateQiTxOutputsAndSignature(tx *types.Transaction, chain ChainContext, 
 	return txFee, nil
 }
 
-func ProcessQiTx(tx *types.Transaction, chain ChainContext, checkSig bool, isFirstQiTx bool, currentHeader *types.WorkObject, batch ethdb.Batch, db ethdb.Reader, gp *types.GasPool, usedGas *uint64, signer types.Signer, location common.Location, chainId big.Int, qiScalingFactor float64, etxRLimit, etxPLimit *uint64, utxosCreatedDeleted *UtxosCreatedDeleted) (*big.Int, []*types.ExternalTx, *types.Receipt, error, map[string]time.Duration) {
+func ProcessQiTx(tx *types.Transaction, chain ChainContext, checkSig bool, isFirstQiTx bool, currentHeader *types.WorkObject, batch ethdb.Batch, db ethdb.Reader, gp *types.GasPool, usedGas *uint64, signer types.Signer, location common.Location, chainId big.Int, qiScalingFactor float64, etxRLimit, etxPLimit *uint64, utxosCreatedDeleted *UtxosCreatedDeleted, supplyAddedQi, supplyRemovedQi *big.Int) (*big.Int, []*types.ExternalTx, *types.Receipt, error, map[string]time.Duration) {
 	var elapsedTime time.Duration
 	stepTimings := make(map[string]time.Duration)
 	prevUsedGas := *usedGas
@@ -1622,6 +1625,8 @@ func ProcessQiTx(tx *types.Transaction, chain ChainContext, checkSig bool, isFir
 		inputs[uint(denomination)]++
 
 		rawdb.DeleteUTXO(batch, txIn.PreviousOutPoint.TxHash, txIn.PreviousOutPoint.Index)
+		supplyRemovedQi.Add(supplyRemovedQi, types.Denominations[denomination])
+
 		utxosCreatedDeleted.UtxosDeletedHashes = append(utxosCreatedDeleted.UtxosDeletedHashes, types.UTXOHash(txIn.PreviousOutPoint.TxHash, txIn.PreviousOutPoint.Index, utxo))
 		utxosCreatedDeleted.UtxosDeleted = append(utxosCreatedDeleted.UtxosDeleted, &types.SpentUtxoEntry{OutPoint: txIn.PreviousOutPoint, UtxoEntry: utxo})
 	}
@@ -1725,6 +1730,8 @@ func ProcessQiTx(tx *types.Transaction, chain ChainContext, checkSig bool, isFir
 			if err := rawdb.CreateUTXO(batch, tx.Hash(), uint16(txOutIdx), utxo); err != nil {
 				return nil, nil, nil, err, nil
 			}
+			supplyAddedQi.Add(supplyAddedQi, types.Denominations[utxo.Denomination])
+
 			utxosCreatedDeleted.UtxosCreatedHashes = append(utxosCreatedDeleted.UtxosCreatedHashes, types.UTXOHash(tx.Hash(), uint16(txOutIdx), utxo))
 			utxosCreatedDeleted.UtxosCreatedKeys = append(utxosCreatedDeleted.UtxosCreatedKeys, rawdb.UtxoKeyWithDenomination(tx.Hash(), uint16(txOutIdx), utxo.Denomination))
 		}
