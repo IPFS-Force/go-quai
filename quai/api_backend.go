@@ -214,16 +214,8 @@ func (b *QuaiAPIBackend) GetOutpointsByAddressAndRange(ctx context.Context, addr
 	return b.quai.core.GetOutpointsByAddressAndRange(address, start, end)
 }
 
-func (b QuaiAPIBackend) GetLockupsByAddressAndRange(ctx context.Context, address common.Address, start, end uint32) ([]*types.Lockup, error) {
-	return b.quai.core.GetLockupsByAddressAndRange(address, start, end)
-}
-
 func (b *QuaiAPIBackend) AddressOutpoints(ctx context.Context, address common.Address) ([]*types.OutpointAndDenomination, error) {
 	return b.quai.core.GetOutpointsByAddress(address)
-}
-
-func (b *QuaiAPIBackend) AddressLockups(ctx context.Context, address common.Address) ([]*types.Lockup, error) {
-	return b.quai.core.GetLockupsByAddress(address)
 }
 
 func (b *QuaiAPIBackend) UTXOsByAddress(ctx context.Context, address common.Address) ([]*types.UtxoEntry, error) {
@@ -371,7 +363,7 @@ func (b *QuaiAPIBackend) GetPoolTransactions() (types.Transactions, error) {
 	if nodeCtx != common.ZONE_CTX {
 		return nil, errors.New("getPoolTransactions can only be called in zone chain")
 	}
-	pending, err := b.quai.core.TxPoolPending(false)
+	pending, err := b.quai.core.TxPoolPending()
 	if err != nil {
 		return nil, err
 	}
@@ -410,8 +402,8 @@ func (b *QuaiAPIBackend) GetPoolNonce(ctx context.Context, addr common.Address) 
 	return b.quai.core.Nonce(addr), nil
 }
 
-func (b *QuaiAPIBackend) SendTxToSharingClients(tx *types.Transaction) {
-	b.quai.core.SendTxToSharingClients(tx)
+func (b *QuaiAPIBackend) SendTxToSharingClients(tx *types.Transaction) error {
+	return b.quai.core.SendTxToSharingClients(tx)
 }
 
 func (b *QuaiAPIBackend) GetRollingFeeInfo() (min, max, avg *big.Int) {

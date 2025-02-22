@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -191,12 +192,14 @@ func New(stack *node.Node, p2p NetworkingAPI, config *quaiconfig.Config, nodeCtx
 		blake3Config := config.Blake3Pow
 		blake3Config.NotifyFull = config.Miner.NotifyFull
 		blake3Config.NodeLocation = config.NodeLocation
+		blake3Config.GenAllocs = config.GenesisAllocs
 		quai.engine = quaiconfig.CreateBlake3ConsensusEngine(stack, config.NodeLocation, &blake3Config, config.Miner.Notify, config.Miner.Noverify, config.Miner.WorkShareThreshold, chainDb, logger)
 	} else {
 		// Transfer mining-related config to the progpow config.
 		progpowConfig := config.Progpow
 		progpowConfig.NodeLocation = config.NodeLocation
 		progpowConfig.NotifyFull = config.Miner.NotifyFull
+		progpowConfig.GenAllocs = config.GenesisAllocs
 		quai.engine = quaiconfig.CreateProgpowConsensusEngine(stack, config.NodeLocation, &progpowConfig, config.Miner.Notify, config.Miner.Noverify, chainDb, logger)
 	}
 	logger.WithField("config", config).Info("Initialized chain configuration")
@@ -351,12 +354,7 @@ func (s *Quai) isLocalBlock(header *types.WorkObject) bool {
 	}
 	// Check whether the given address is specified by `txpool.local`
 	// CLI flag.
-	for _, account := range s.config.TxPool.Locals {
-		if account == internal {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.config.TxPool.Locals, internal)
 }
 
 // shouldPreserve checks whether we should preserve the given block

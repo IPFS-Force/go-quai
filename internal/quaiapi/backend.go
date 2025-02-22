@@ -66,9 +66,7 @@ type Backend interface {
 	StateAndHeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*state.StateDB, *types.WorkObject, error)
 	StateAndHeaderByNumberOrHash(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*state.StateDB, *types.WorkObject, error)
 	AddressOutpoints(ctx context.Context, address common.Address) ([]*types.OutpointAndDenomination, error)
-	AddressLockups(ctx context.Context, address common.Address) ([]*types.Lockup, error)
 	GetOutpointsByAddressAndRange(ctx context.Context, address common.Address, start, end uint32) ([]*types.OutpointAndDenomination, error)
-	GetLockupsByAddressAndRange(ctx context.Context, address common.Address, start, end uint32) ([]*types.Lockup, error)
 	UTXOsByAddress(ctx context.Context, address common.Address) ([]*types.UtxoEntry, error)
 	GetReceipts(ctx context.Context, hash common.Hash) (types.Receipts, error)
 	GetEVM(ctx context.Context, msg core.Message, state *state.StateDB, header *types.WorkObject, parent *types.WorkObject, vmConfig *vm.Config) (*vm.EVM, func() error, error)
@@ -142,7 +140,7 @@ type Backend interface {
 	TxPoolContent() (map[common.InternalAddress]types.Transactions, map[common.InternalAddress]types.Transactions)
 	TxPoolContentFrom(addr common.Address) (types.Transactions, types.Transactions)
 	GetPoolGasPrice() *big.Int
-	SendTxToSharingClients(tx *types.Transaction)
+	SendTxToSharingClients(tx *types.Transaction) error
 	GetRollingFeeInfo() (min, max, avg *big.Int)
 
 	// Filter API

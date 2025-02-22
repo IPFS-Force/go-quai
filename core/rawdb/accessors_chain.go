@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"slices"
 	"sort"
 
 	"github.com/dominant-strategies/go-quai/common"
@@ -739,12 +740,7 @@ func DeleteReceipts(db ethdb.KeyValueWriter, hash common.Hash, number uint64) {
 
 func IsGenesisHash(db ethdb.Reader, hash common.Hash) bool {
 	genesisHashes := ReadGenesisHashes(db)
-	for _, genesisHash := range genesisHashes {
-		if hash == genesisHash {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(genesisHashes, hash)
 }
 
 // FindCommonAncestor returns the last common ancestor of two block headers
@@ -1215,92 +1211,6 @@ func DeleteOutpointsForAddress(db ethdb.KeyValueWriter, address [20]byte) {
 	}
 }
 
-func WriteAddressLockups(db ethdb.KeyValueWriter, lockupMap map[[20]byte][]*types.Lockup) error {
-	for addressWithBlockHeight, lockups := range lockupMap {
-		if err := WriteLockupsForAddressAtBlock(db, addressWithBlockHeight, lockups); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func WriteLockupsForAddressAtBlock(db ethdb.KeyValueWriter, address [20]byte, lockups []*types.Lockup) error {
-	addressLockupsProto := &types.ProtoLockups{
-		Lockups: make([]*types.ProtoLockup, 0, len(lockups)),
-	}
-
-	for _, lockup := range lockups {
-		lockupProto := &types.ProtoLockup{
-			Value:        lockup.Value.Bytes(),
-			UnlockHeight: lockup.UnlockHeight,
-		}
-
-		addressLockupsProto.Lockups = append(addressLockupsProto.Lockups, lockupProto)
-	}
-
-	// Now, marshal utxosProto to protobuf bytes
-	data, err := proto.Marshal(addressLockupsProto)
-	if err != nil {
-		db.Logger().WithField("err", err).Fatal("Failed to rlp encode utxos")
-	}
-	if err := db.Put(addressLockupsKey(address), data); err != nil {
-		db.Logger().WithField("err", err).Fatal("Failed to store utxos")
-	}
-	return nil
-}
-
-func ReadLockupsForAddressAtBlock(db ethdb.Reader, address [20]byte) ([]*types.Lockup, error) {
-	// Try to look up the data in leveldb.
-	data, _ := db.Get(addressLockupsKey(address))
-	if len(data) == 0 {
-		return []*types.Lockup{}, nil
-	}
-	addressLockupsProto := &types.ProtoLockups{
-		Lockups: make([]*types.ProtoLockup, 0),
-	}
-	if err := proto.Unmarshal(data, addressLockupsProto); err != nil {
-		return nil, err
-	}
-	lockups := make([]*types.Lockup, 0, len(addressLockupsProto.Lockups))
-
-	for _, lockupProto := range addressLockupsProto.Lockups {
-		lockup := &types.Lockup{
-			Value:        new(big.Int).SetBytes(lockupProto.Value),
-			UnlockHeight: lockupProto.UnlockHeight,
-		}
-		lockups = append(lockups, lockup)
-	}
-
-	return lockups, nil
-}
-
-func ReadLockupsForAddress(db ethdb.Database, address common.Address) ([]*types.Lockup, error) {
-	prefix := append(AddressLockupsPrefix, address.Bytes()[:16]...)
-	it := db.NewIterator(prefix, nil)
-	defer it.Release()
-	lockups := make([]*types.Lockup, 0)
-	for it.Next() {
-		if len(it.Key()) != len(AddressUtxosPrefix)+common.AddressLength {
-			continue
-		}
-		addressLockupsProto := &types.ProtoLockups{
-			Lockups: make([]*types.ProtoLockup, 0),
-		}
-		if err := proto.Unmarshal(it.Value(), addressLockupsProto); err != nil {
-			db.Logger().WithField("err", err).Fatal("Failed to proto Unmarshal addressOutpointsProto")
-			return nil, err
-		}
-		for _, lockupProto := range addressLockupsProto.Lockups {
-			lockup := &types.Lockup{
-				Value:        new(big.Int).SetBytes(lockupProto.Value),
-				UnlockHeight: lockupProto.UnlockHeight,
-			}
-			lockups = append(lockups, lockup)
-		}
-	}
-	return lockups, nil
-}
-
 func WriteGenesisHashes(db ethdb.KeyValueWriter, hashes common.Hashes) {
 	protoHashes := hashes.ProtoEncode()
 	data, err := proto.Marshal(protoHashes)
@@ -1587,12 +1497,17 @@ func DeleteCreatedCoinbaseLockupKeys(db ethdb.KeyValueWriter, blockHash common.H
 	}
 }
 
-func WriteDeletedCoinbaseLockups(db ethdb.KeyValueWriter, blockHash common.Hash, deletedLockups map[[CoinbaseLockupKeyLength]byte][]byte) error {
+type DeletedCoinbaseLockup struct {
+	Key   []byte
+	Value []byte
+}
+
+func WriteDeletedCoinbaseLockups(db ethdb.KeyValueWriter, blockHash common.Hash, deletedLockups []DeletedCoinbaseLockup) error {
 	protoKeysAndValues := &types.ProtoKeysAndValues{KeysAndValues: make([]*types.ProtoKeyValue, 0, len(deletedLockups))}
-	for key, value := range deletedLockups {
+	for _, lockup := range deletedLockups {
 		protoKeysAndValues.KeysAndValues = append(protoKeysAndValues.KeysAndValues, &types.ProtoKeyValue{
-			Key:   key[:],
-			Value: value,
+			Key:   lockup.Key,
+			Value: lockup.Value,
 		})
 	}
 	data, err := proto.Marshal(protoKeysAndValues)
@@ -1602,7 +1517,7 @@ func WriteDeletedCoinbaseLockups(db ethdb.KeyValueWriter, blockHash common.Hash,
 	return db.Put(deletedCoinbaseLockupsKey(blockHash), data)
 }
 
-func ReadDeletedCoinbaseLockups(db ethdb.Reader, blockHash common.Hash) (map[[CoinbaseLockupKeyLength]byte][]byte, error) {
+func ReadDeletedCoinbaseLockups(db ethdb.Reader, blockHash common.Hash) ([]*DeletedCoinbaseLockup, error) {
 	// Try to look up the data in leveldb.
 	data, _ := db.Get(deletedCoinbaseLockupsKey(blockHash))
 	if len(data) == 0 {
@@ -1612,12 +1527,12 @@ func ReadDeletedCoinbaseLockups(db ethdb.Reader, blockHash common.Hash) (map[[Co
 	if err := proto.Unmarshal(data, protoKeysAndValues); err != nil {
 		return nil, err
 	}
-	deletedLockups := make(map[[CoinbaseLockupKeyLength]byte][]byte)
+	deletedLockups := make([]*DeletedCoinbaseLockup, 0, len(protoKeysAndValues.KeysAndValues))
 	for _, keyValue := range protoKeysAndValues.KeysAndValues {
-		if len(keyValue.Key) != 47 {
+		if len(keyValue.Key) != CoinbaseLockupKeyLength {
 			return nil, fmt.Errorf("invalid key length %d", len(keyValue.Key))
 		}
-		deletedLockups[[CoinbaseLockupKeyLength]byte(keyValue.Key)] = keyValue.Value
+		deletedLockups = append(deletedLockups, &DeletedCoinbaseLockup{Key: keyValue.Key, Value: keyValue.Value})
 	}
 	return deletedLockups, nil
 }
@@ -1851,6 +1766,22 @@ func WriteCoinbaseLockupToMap(coinbaseMap map[[CoinbaseLockupKeyLength]byte][]by
 	return nil
 }
 
+func WriteCoinbaseLockupToSlice(amount *big.Int, blockHeight uint32, elements uint16, delegate common.Address) ([]byte, error) {
+	data := make([]byte, 38)
+	amountBytes := amount.Bytes()
+	if len(amountBytes) > 32 {
+		return nil, fmt.Errorf("amount is too large")
+	}
+	// Right-align amountBytes in data[:32]
+	copy(data[32-len(amountBytes):32], amountBytes)
+	binary.BigEndian.PutUint32(data[32:36], blockHeight)
+	binary.BigEndian.PutUint16(data[36:38], elements)
+	if !delegate.Equal(common.Zero) {
+		data = append(data, delegate.Bytes()...)
+	}
+	return data, nil
+}
+
 func DeleteCoinbaseLockup(db ethdb.KeyValueWriter, ownerContract common.Address, beneficiaryMiner common.Address, lockupByte byte, epoch uint32) [CoinbaseLockupKeyLength]byte {
 	key := CoinbaseLockupKey(ownerContract, beneficiaryMiner, lockupByte, epoch)
 	if err := db.Delete(key); err != nil {
@@ -1860,4 +1791,173 @@ func DeleteCoinbaseLockup(db ethdb.KeyValueWriter, ownerContract common.Address,
 		db.Logger().Fatal("CoinbaseLockupKey is not 47 bytes")
 	}
 	return [CoinbaseLockupKeyLength]byte(key)
+}
+
+func WriteSupplyAnalyticsForBlock(db ethdb.KeyValueWriter, readDb ethdb.Reader, blockHash common.Hash, parentHash common.Hash, supplyAddedQuai, supplyRemovedQuai, supplyAddedQi, supplyRemovedQi *big.Int) error {
+	supplyDeltaQuai := new(big.Int).Sub(supplyAddedQuai, supplyRemovedQuai)
+	supplyDeltaQi := new(big.Int).Sub(supplyAddedQi, supplyRemovedQi)
+
+	_, _, totalSupplyQuai, _, _, totalSupplyQi, err := ReadSupplyAnalyticsForBlock(readDb, parentHash)
+	if err != nil {
+		db.Logger().WithField("err", err).Error("Failed to read total supply")
+		return err
+	}
+
+	totalSupplyQuai.Add(totalSupplyQuai, supplyDeltaQuai)
+
+	totalSupplyQi.Add(totalSupplyQi, supplyDeltaQi)
+
+	protoSupplyAnalytics := &types.ProtoSupplyAnalytics{
+		SupplyAddedQuai:   supplyAddedQuai.Bytes(),
+		SupplyRemovedQuai: supplyRemovedQuai.Bytes(),
+		SupplyAddedQi:     supplyAddedQi.Bytes(),
+		SupplyRemovedQi:   supplyRemovedQi.Bytes(),
+		TotalSupplyQuai:   totalSupplyQuai.Bytes(),
+		TotalSupplyQi:     totalSupplyQi.Bytes(),
+	}
+	data, err := proto.Marshal(protoSupplyAnalytics)
+	if err != nil {
+		return err
+	}
+	return db.Put(supplyAnalyticsKey(blockHash), data)
+}
+
+func ReadSupplyAnalyticsForBlock(db ethdb.Reader, blockHash common.Hash) (*big.Int, *big.Int, *big.Int, *big.Int, *big.Int, *big.Int, error) {
+	data, _ := db.Get(supplyAnalyticsKey(blockHash))
+	if len(data) == 0 {
+		return big.NewInt(0), big.NewInt(0), big.NewInt(0), big.NewInt(0), big.NewInt(0), big.NewInt(0), nil
+	}
+	protoSupplyAnalytics := new(types.ProtoSupplyAnalytics)
+	if err := proto.Unmarshal(data, protoSupplyAnalytics); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	supplyAddedQuai := new(big.Int).SetBytes(protoSupplyAnalytics.SupplyAddedQuai)
+	supplyRemovedQuai := new(big.Int).SetBytes(protoSupplyAnalytics.SupplyRemovedQuai)
+	totalSupplyQuai := new(big.Int).SetBytes(protoSupplyAnalytics.TotalSupplyQuai)
+	supplyAddedQi := new(big.Int).SetBytes(protoSupplyAnalytics.SupplyAddedQi)
+	supplyRemovedQi := new(big.Int).SetBytes(protoSupplyAnalytics.SupplyRemovedQi)
+	totalSupplyQi := new(big.Int).SetBytes(protoSupplyAnalytics.TotalSupplyQi)
+	return supplyAddedQuai, supplyRemovedQuai, totalSupplyQuai, supplyAddedQi, supplyRemovedQi, totalSupplyQi, nil
+}
+
+func WriteNewLockups(db ethdb.KeyValueWriter, readDb ethdb.Reader, blockHash common.Hash, newLocks map[common.InternalAddress]*big.Int, newUnlocks []common.Unlock) {
+
+	deltas := make(map[common.InternalAddress]*big.Int)
+	for addr, amount := range newLocks {
+		if _, ok := deltas[addr]; !ok {
+			deltas[addr] = new(big.Int).Set(amount)
+		} else {
+			// Shouldn't be possible
+			db.Logger().Errorf("Address %s has multiple lockups\n", addr)
+			deltas[addr].Add(deltas[addr], amount)
+		}
+	}
+	for _, unlock := range newUnlocks {
+		if _, ok := deltas[unlock.Addr]; !ok {
+			deltas[unlock.Addr] = new(big.Int).Neg(unlock.Amt)
+		} else {
+			deltas[unlock.Addr].Sub(deltas[unlock.Addr], unlock.Amt)
+		}
+	}
+	protoDeltas := &types.ProtoKeysAndValues{KeysAndValues: make([]*types.ProtoKeyValue, 0, len(deltas))}
+	for addr, delta := range deltas {
+		protoDeltas.KeysAndValues = append(protoDeltas.KeysAndValues, &types.ProtoKeyValue{
+			Key:   addr.Bytes(),
+			Value: delta.Bytes(),
+		})
+		data, _ := readDb.Get(addressLockupsKey(addr))
+		if len(data) == 0 {
+			if delta.Sign() >= 0 {
+				if err := db.Put(addressLockupsKey(addr), delta.Bytes()); err != nil {
+					db.Logger().WithField("err", err).Error("Failed to store new lockups 1")
+				}
+			} else {
+				db.Logger().Errorf("Address %s has negative delta %s\n", addr, delta)
+				if err := db.Put(addressLockupsKey(addr), []byte{0}); err != nil {
+					db.Logger().WithField("err", err).Error("Failed to store new lockups 2")
+				}
+			}
+			continue
+		} else if len(data) > 32 {
+			db.Logger().Errorf("Address %s has invalid lockup data %s\n", addr, data)
+			continue
+		}
+		value := new(big.Int).SetBytes(data)
+		value.Add(value, delta)
+		if value.Sign() < 0 {
+			db.Logger().Errorf("Address %s has negative lockup %s\n", addr, value)
+			if err := db.Put(addressLockupsKey(addr), []byte{0}); err != nil {
+				db.Logger().WithField("err", err).Error("Failed to store new lockups 3")
+			}
+		} else {
+			if err := db.Put(addressLockupsKey(addr), value.Bytes()); err != nil {
+				db.Logger().WithField("err", err).Error("Failed to store new lockups 4")
+			}
+		}
+	}
+	data, err := proto.Marshal(protoDeltas)
+	if err != nil {
+		db.Logger().WithField("err", err).Error("Failed to store new lockups")
+		return
+	}
+	if err := db.Put(lockupDeltasKey(blockHash), data); err != nil {
+		db.Logger().WithField("err", err).Error("Failed to store new lockups")
+	}
+}
+
+func UndoNewLockupsForBlock(db ethdb.KeyValueWriter, readDb ethdb.Reader, blockHash common.Hash) {
+	data, _ := readDb.Get(lockupDeltasKey(blockHash))
+	if len(data) == 0 {
+		return
+	}
+	protoDeltas := new(types.ProtoKeysAndValues)
+	if err := proto.Unmarshal(data, protoDeltas); err != nil {
+		db.Logger().WithField("err", err).Error("Failed to unmarshal lockup deltas")
+		return
+	}
+	for _, delta := range protoDeltas.KeysAndValues {
+		if len(delta.Key) != common.AddressLength {
+			db.Logger().Errorf("Invalid address length %d\n", len(delta.Key))
+			continue
+		}
+		addr := common.InternalAddress(delta.Key)
+		amount := new(big.Int).Neg(new(big.Int).SetBytes(delta.Value))
+		data, _ := readDb.Get(addressLockupsKey(addr))
+		if len(data) == 0 {
+			if amount.Sign() >= 0 {
+				if err := db.Put(addressLockupsKey(addr), amount.Bytes()); err != nil {
+					db.Logger().WithField("err", err).Error("Failed to store new lockups")
+				}
+			} else {
+				db.Logger().Errorf("Address %s has negative delta %s\n", addr, delta)
+				if err := db.Put(addressLockupsKey(addr), []byte{0}); err != nil {
+					db.Logger().WithField("err", err).Error("Failed to store new lockups")
+				}
+			}
+			continue
+		} else if len(data) > 32 {
+			db.Logger().Errorf("Address %s has invalid lockup data %s\n", addr, data)
+			continue
+		}
+		value := new(big.Int).SetBytes(data)
+		value.Add(value, amount)
+		if value.Sign() < 0 {
+			db.Logger().Errorf("Address %s has negative lockup %s\n", addr, value)
+			if err := db.Put(addressLockupsKey(addr), []byte{0}); err != nil {
+				db.Logger().WithField("err", err).Error("Failed to store new lockups")
+			}
+		} else {
+			if err := db.Put(addressLockupsKey(addr), value.Bytes()); err != nil {
+				db.Logger().WithField("err", err).Error("Failed to store new lockups")
+			}
+		}
+	}
+}
+
+func ReadLockedBalance(db ethdb.Reader, addr common.InternalAddress) *big.Int {
+	data, _ := db.Get(addressLockupsKey(addr))
+	if len(data) == 0 {
+		return big.NewInt(0)
+	}
+	return new(big.Int).SetBytes(data)
 }

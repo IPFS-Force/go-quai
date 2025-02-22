@@ -25,6 +25,7 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 
+	"github.com/dominant-strategies/go-quai/cmd/genallocs"
 	"github.com/dominant-strategies/go-quai/common"
 	"github.com/dominant-strategies/go-quai/common/constants"
 	"github.com/dominant-strategies/go-quai/common/fdlimit"
@@ -125,6 +126,7 @@ var NodeFlags = []Flag{
 var TXPoolFlags = []Flag{
 	TxPoolLocalsFlag,
 	TxPoolNoLocalsFlag,
+	TxPoolSyncTxWithReturnFlag,
 	TxPoolJournalFlag,
 	TxPoolRejournalFlag,
 	TxPoolPriceLimitFlag,
@@ -299,7 +301,7 @@ var (
 
 	SlicesRunningFlag = Flag{
 		Name:  c_NodeFlagPrefix + "slices",
-		Value: "",
+		Value: "[0 0]",
 		Usage: "All the slices that are running on this node" + generateEnvDoc(c_NodeFlagPrefix+"slices"),
 	}
 
@@ -355,6 +357,12 @@ var (
 		Name:  c_TXPoolPrefix + "nolocals",
 		Value: false,
 		Usage: "Disables price exemptions for locally submitted transactions" + generateEnvDoc(c_TXPoolPrefix+"nolocals"),
+	}
+
+	TxPoolSyncTxWithReturnFlag = Flag{
+		Name:  c_TXPoolPrefix + "sync-tx-with-return",
+		Value: true,
+		Usage: "Shares the tx with the sharing client with syncronous return (also bypasses local pool, only use it with combination of sharing clients)" + generateEnvDoc(c_TXPoolPrefix+"sync-tx-with-return"),
 	}
 
 	TxPoolJournalFlag = Flag{
@@ -521,13 +529,13 @@ var (
 
 	QuaiCoinbaseFlag = Flag{
 		Name:  c_NodeFlagPrefix + "quai-coinbases",
-		Value: "",
+		Value: "0x0000000000000000000000000000000000000001",
 		Usage: "Input TOML string or path to TOML file" + generateEnvDoc(c_NodeFlagPrefix+"quai-coinbase"),
 	}
 
 	QiCoinbaseFlag = Flag{
 		Name:  c_NodeFlagPrefix + "qi-coinbases",
-		Value: "",
+		Value: "0x0080000000000000000000000000000000000001",
 		Usage: "Input TOML string or path to TOML file" + generateEnvDoc(c_NodeFlagPrefix+"qi-coinbase"),
 	}
 
@@ -599,7 +607,7 @@ var (
 
 	GenesisNonce = Flag{
 		Name:  c_NodeFlagPrefix + "genesis-nonce",
-		Value: "",
+		Value: "23621466532946281564673705261963422",
 		Usage: "Nonce hex string to use for the genesis block" + generateEnvDoc(c_NodeFlagPrefix+"genesis-nonce"),
 	}
 )
@@ -797,6 +805,9 @@ func ParseCoinbaseAddresses() (map[string]common.Address, error) {
 	}
 
 	for _, quaiCoinbase := range strings.Split(quaiCoinbases, ",") {
+		if quaiCoinbase == "0x0000000000000000000000000000000000000001" {
+			log.Global.Warn("Default Quai coinbase address is being used. If you are not mining, you can ignore this message, otherwise please set --quai-coinbases.")
+		}
 		quaiAddr, err := isValidAddress(quaiCoinbase)
 		if err != nil {
 			log.Global.WithField("err", err).Fatalf("Error parsing quai address")
@@ -807,6 +818,9 @@ func ParseCoinbaseAddresses() (map[string]common.Address, error) {
 	}
 
 	for _, qiCoinbase := range strings.Split(qiCoinbases, ",") {
+		if qiCoinbase == "0x0080000000000000000000000000000000000001" {
+			log.Global.Warn("Default Qi coinbase address is being used. If you are not mining, you can ignore this message, otherwise please set --qi-coinbases.")
+		}
 		qiAddr, err := isValidAddress(qiCoinbase)
 		if err != nil {
 			log.Global.WithField("err", err).Fatalf("Error parsing qi address")
@@ -1134,6 +1148,7 @@ func setTxPool(cfg *core.TxPoolConfig, nodeLocation common.Location) {
 	if viper.IsSet(TxPoolNoLocalsFlag.Name) {
 		cfg.NoLocals = viper.GetBool(TxPoolNoLocalsFlag.Name)
 	}
+	cfg.SyncTxWithReturn = viper.GetBool(TxPoolSyncTxWithReturnFlag.Name)
 	if viper.IsSet(TxPoolJournalFlag.Name) {
 		cfg.Journal = viper.GetString(TxPoolJournalFlag.Name)
 	}
@@ -1526,6 +1541,14 @@ func SetQuaiConfig(stack *node.Node, cfg *quaiconfig.Config, slicesRunning []com
 		}
 	}
 
+	cfg.Genesis.AllocHash = params.AllocHash
+	if nodeLocation.Equal(common.Location{0, 0}) {
+		cfg.GenesisAllocs, err = genallocs.VerifyGenesisAllocs("cmd/genallocs/genesis_alloc.json", cfg.Genesis.AllocHash)
+		if err != nil {
+			log.Global.WithField("err", err).Fatal("Unable to allocate genesis accounts")
+		}
+	}
+
 	cfg.Genesis.Config.Location = nodeLocation
 }
 
@@ -1565,7 +1588,8 @@ func MakeChainDatabase(stack *node.Node, readonly bool) ethdb.Database {
 
 func GetGenesisNonce() (uint64, []byte) {
 	nonceBytes := common.FromHex(viper.GetString(GenesisNonce.Name))
-	if len(nonceBytes) == 0 {
+	if len(nonceBytes) < 8 {
+		log.Global.Error("Genesis nonce is too short, using default")
 		nonceBytes = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	}
 	nonce := binary.BigEndian.Uint64(nonceBytes[:8])

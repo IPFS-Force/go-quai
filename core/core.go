@@ -1284,24 +1284,6 @@ func (c *Core) GetOutpointsByAddress(address common.Address) ([]*types.OutpointA
 	return rawdb.ReadOutpointsForAddress(c.sl.sliceDb, address)
 }
 
-func (c *Core) GetLockupsByAddressAndRange(address common.Address, start, end uint32) ([]*types.Lockup, error) {
-	lockups := make([]*types.Lockup, 0)
-	for i := start; i <= end; i++ {
-		addr20 := address.Bytes20()
-		binary.BigEndian.PutUint32(addr20[16:], i)
-		lockupsAtBlock, err := rawdb.ReadLockupsForAddressAtBlock(c.sl.sliceDb, addr20)
-		if err != nil {
-			return nil, err
-		}
-		lockups = append(lockups, lockupsAtBlock...)
-	}
-	return lockups, nil
-}
-
-func (c *Core) GetLockupsByAddress(address common.Address) ([]*types.Lockup, error) {
-	return rawdb.ReadLockupsForAddress(c.sl.sliceDb, address)
-}
-
 func (c *Core) GetUTXOsByAddress(address common.Address) ([]*types.UtxoEntry, error) {
 	outpointsForAddress, err := c.GetOutpointsByAddress(address)
 	if err != nil {
@@ -1342,8 +1324,8 @@ func (c *Core) AddRemotes(txs types.Transactions) {
 	}
 }
 
-func (c *Core) TxPoolPending(enforceTips bool) (map[common.AddressBytes]types.Transactions, error) {
-	return c.sl.txPool.TxPoolPending(enforceTips)
+func (c *Core) TxPoolPending() (map[common.AddressBytes]types.Transactions, error) {
+	return c.sl.txPool.TxPoolPending()
 }
 
 func (c *Core) Get(hash common.Hash) *types.Transaction {
@@ -1380,8 +1362,8 @@ func (c *Core) ContentFrom(addr common.Address) (types.Transactions, types.Trans
 	}
 	return c.sl.txPool.ContentFrom(internal)
 }
-func (c *Core) SendTxToSharingClients(tx *types.Transaction) {
-	c.sl.txPool.SendTxToSharingClients(tx)
+func (c *Core) SendTxToSharingClients(tx *types.Transaction) error {
+	return c.sl.txPool.SendTxToSharingClients(tx)
 }
 
 func (c *Core) GetRollingFeeInfo() (min, max, avg *big.Int) {

@@ -18,9 +18,13 @@
 package quaiconfig
 
 import (
+	"fmt"
 	"math/big"
+	"reflect"
+	"strings"
 	"time"
 
+	"github.com/dominant-strategies/go-quai/cmd/genallocs"
 	"github.com/dominant-strategies/go-quai/common"
 	"github.com/dominant-strategies/go-quai/consensus"
 	"github.com/dominant-strategies/go-quai/consensus/blake3pow"
@@ -78,6 +82,8 @@ type Config struct {
 	// Genesis nonce used to start the network
 	GenesisNonce uint64 `toml:",omitempty"`
 	GenesisExtra []byte `toml:",omitempty"`
+	// Genesis Allocs for starting
+	GenesisAllocs []genallocs.GenesisAccount
 
 	// Protocol options
 	NetworkId uint64 // Network ID to use for selecting peers to connect to
@@ -182,6 +188,7 @@ func CreateProgpowConsensusEngine(stack *node.Node, nodeLocation common.Location
 		DurationLimit:      config.DurationLimit,
 		NodeLocation:       nodeLocation,
 		GasCeil:            config.GasCeil,
+		GenAllocs:          config.GenAllocs,
 		MinDifficulty:      config.MinDifficulty,
 		WorkShareThreshold: config.WorkShareThreshold,
 	}, notify, noverify, logger)
@@ -206,9 +213,23 @@ func CreateBlake3ConsensusEngine(stack *node.Node, nodeLocation common.Location,
 		DurationLimit:      config.DurationLimit,
 		NodeLocation:       nodeLocation,
 		GasCeil:            config.GasCeil,
+		GenAllocs:          config.GenAllocs,
 		MinDifficulty:      config.MinDifficulty,
 		WorkShareThreshold: workShareThreshold,
 	}, notify, noverify, logger)
 	engine.SetThreads(-1) // Disable CPU mining
 	return engine
+}
+
+func (c Config) String() string {
+	var fields []string
+	v := reflect.ValueOf(c)
+	t := reflect.TypeOf(c)
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).Name == "GenesisAllocs" {
+			continue
+		}
+		fields = append(fields, fmt.Sprintf("%s: %v", t.Field(i).Name, v.Field(i).Interface()))
+	}
+	return fmt.Sprintf("Config{%s}", strings.Join(fields, ", "))
 }

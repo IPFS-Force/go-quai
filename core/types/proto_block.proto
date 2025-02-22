@@ -260,8 +260,31 @@ message ProtoBetas {
 message ProtoLockup {
   bytes value = 1;
   uint64 unlock_height = 2;
+  common.ProtoAddress address = 3;
+}
+
+message ProtoUnlock {
+  bytes value = 1;
+  common.ProtoAddress address = 2;
+}
+
+message ProtoUnlocks {
+  repeated ProtoUnlock unlocks = 1;
+}
+
+message ProtoLockedBalance {
+  bytes value = 1;
 }
 
 message ProtoLockups {
   repeated ProtoLockup lockups = 1;
+}
+
+message ProtoSupplyAnalytics {
+  bytes supply_added_quai = 1;
+  bytes supply_removed_quai = 2;
+  bytes supply_added_qi = 3;
+  bytes supply_removed_qi = 4;
+  bytes total_supply_quai = 5;
+  bytes total_supply_qi = 6;
 }
