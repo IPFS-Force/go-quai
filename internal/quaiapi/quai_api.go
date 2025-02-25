@@ -18,6 +18,7 @@ package quaiapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -988,6 +989,14 @@ func RPCMarshalBlock(backend Backend, block *types.WorkObject, inclTx bool, full
 	fields["workshares"] = marshalWorkShares
 	fields["subManifest"] = block.Manifest()
 	fields["interlinkHashes"] = block.InterlinkHashes()
+
+	if inclTx {
+		out, err := json.MarshalIndent(fields, "", "  ")
+		if err != nil {
+			log.Global.Println("debug marshal:", err)
+		}
+		log.Global.Println("fields:", string(out))
+	}
 
 	return fields, nil
 }
