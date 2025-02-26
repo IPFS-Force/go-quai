@@ -682,6 +682,12 @@ func (tx *Transaction) Hash(location ...byte) (h common.Hash) {
 	if hash := tx.hash.Load(); hash != nil {
 		return hash.(common.Hash)
 	}
+	h = tx.HashNoCache(location...)
+	tx.hash.Store(h)
+	return h
+}
+
+func (tx *Transaction) HashNoCache(location ...byte) (h common.Hash) {
 	protoTx, _ := tx.ProtoEncode()
 	data, _ := proto.Marshal(protoTx)
 	h = crypto.Keccak256Hash(data)
@@ -729,7 +735,6 @@ func (tx *Transaction) Hash(location ...byte) (h common.Hash) {
 		h[2] = origin
 		h[3] |= 0x80
 	}
-	tx.hash.Store(h)
 	return h
 }
 

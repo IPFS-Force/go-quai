@@ -287,9 +287,19 @@ func (t *Transaction) UnmarshalJSON(input []byte) error {
 
 	// Now set the inner transaction.
 	t.setDecoded(inner, 0)
-	if t.Hash() != dec.Hash {
+
+	if t.HashNoCache() != dec.Hash {
+		log.Printf("transaction hash mismatch: have %v, want %v", t.HashNoCache(), dec.Hash)
+		inner := t.inner.(*QuaiTx)
+		inner.ParentHash = &common.Hash{}
+		inner.MixHash = &common.Hash{}
+		inner.WorkNonce = &BlockNonce{}
+		if t.HashNoCache() != dec.Hash {
+			log.Printf("hash still mismatched: have %v, want %v", t.HashNoCache(), dec.Hash)
+		}
+
 		indent := "  "
-		tOut, err := json.MarshalIndent(*t.inner.(*QuaiTx), "", indent)
+		tOut, err := json.MarshalIndent(inner, "", indent)
 		if err != nil {
 			panic(err)
 		}
@@ -298,10 +308,7 @@ func (t *Transaction) UnmarshalJSON(input []byte) error {
 			panic(err)
 		}
 
-		log.Printf(`transaction hash mismatch: have %v, want %v
-		transaction inner: %s
-		dec: %s`,
-			t.Hash(), dec.Hash, string(tOut), string(decOut))
+		log.Printf("transaction inner: %s\ndec: %s", string(tOut), string(decOut))
 	}
 
 	// TODO: check hash here?
