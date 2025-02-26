@@ -294,9 +294,11 @@ func (t *Transaction) UnmarshalJSON(input []byte) error {
 		inner.ParentHash = &common.Hash{}
 		inner.MixHash = &common.Hash{}
 		inner.WorkNonce = &BlockNonce{}
-		if t.HashNoCache() != dec.Hash {
-			log.Printf("hash still mismatched: have %v, want %v", t.HashNoCache(), dec.Hash)
+		if t.HashNoCache() == dec.Hash {
+			log.Printf("hash matched after setting fields")
+			return nil
 		}
+		log.Printf("hash still mismatched: have %v, want %v", t.HashNoCache(), dec.Hash)
 
 		indent := "  "
 		tOut, err := json.MarshalIndent(inner, "", indent)
